@@ -76,6 +76,7 @@ class Board(unittest.TestCase):
         self.assertIn("deployed: prod", self.kb("show", "1").stdout)
         self.assertIn("board empty", self.kb("board").stdout)
         self.assertIn("ship it", self.kb("board", "--closed", "1").stdout)
+        self.kb("release", "1", as_=a, ok=False)
 
     def test_request_lifecycle(self):
         asker, helper, other = self.session("asker"), self.session("helper"), self.session("x")

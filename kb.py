@@ -508,6 +508,8 @@ def cmd_release(conn, args) -> int:
     me = current(conn, args)
     with tx(conn):
         t = get_ticket(conn, args.id)
+        if t["status"] != "claimed":
+            raise Refused(f"#{t['id']} is {t['status']}, not claimed")
         if t["owner_session"] != me["id"] and me["id"] != CURATOR:
             raise Refused(f"#{t['id']} is not yours")
         conn.execute(

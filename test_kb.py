@@ -1,4 +1,6 @@
 """End-to-end tests: run kb.py as a subprocess against a temporary database."""
+import contextlib
+import io
 import json
 import os
 import sqlite3
@@ -8,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 KB = Path(__file__).with_name("kb.py")
@@ -28,7 +31,9 @@ class Board(unittest.TestCase):
              if k not in ("KB", "BRAIN_SESSION_CONTEXT", "KB_SESSION")}
         e.update({"KB_DB": str(self.db), "KB_HARNESS": "none", **(env or {})})
         cmd = [sys.executable, str(KB)] + (["--session", as_] if as_ else []) + list(args)
-        r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, cwd=self.repo, env=e)
+        # A new session has no controlling terminal, like an agent's tool shell.
+        r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, cwd=self.repo, env=e,
+                           start_new_session=True)
         if ok is not None:
             self.assertEqual(r.returncode == 0, ok, f"{args}: {r.stdout}{r.stderr}")
         return r
@@ -85,15 +90,36 @@ class Board(unittest.TestCase):
         self.kb("close", "1", as_=helper, ok=False)  # only the opener closes
         self.kb("close", "1", as_=asker)
 
-    def test_curator_is_the_shell_outside_harnesses(self):
+    def test_curator_is_a_human_at_a_terminal(self):
         a = self.session("a")
         self.kb("add", "--type", "request", "--to", "curator", "--label", "approval",
                 "merge feature branch", "--note", "git merge --ff-only feat", as_=a)
         board = self.kb("board", "--to", "curator").stdout
         self.assertIn("merge feature branch (approval)", board)
-        self.kb("claim", "1")
-        self.kb("note", "1", "--reply", "approved")
+        # Without a terminal (an agent shell) the curator is refused, even with KB_HARNESS=none.
+        self.assertIn("human at a terminal", self.kb("claim", "1", ok=False).stderr)
+        sys.path.insert(0, str(KB.parent))
+        import kb
+        kb.DB_PATH, allowed = self.db, kb.curator_allowed
+        kb.curator_allowed = lambda: True
+        env = {"KB_HARNESS": "none", "KB_SESSION": ""}
+        try:
+            with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(kb.main(["claim", "1"]), 0)
+                self.assertEqual(kb.main(["note", "1", "--reply", "approved"]), 0)
+        finally:
+            kb.curator_allowed = allowed
         self.kb("close", "1", as_=a)
+
+    def test_same_name_addressee_cannot_close_its_own_reply(self):
+        a, b = self.session("demo"), self.session("demo")
+        self.kb("add", "--type", "request", "--to", "demo", "check the import", as_=a)
+        self.kb("claim", "1", as_=b)
+        self.kb("note", "1", "--reply", "done", as_=b)
+        self.kb("end", as_=a)
+        self.kb("close", "1", as_=b, ok=False)
+        c = self.session("demo")
+        self.kb("close", "1", as_=c)
 
     def test_hooks_register_notify_and_flag(self):
         start = json.loads(self.hook("start", "claude", "s1"))
@@ -151,13 +177,14 @@ class Board(unittest.TestCase):
         self.kb("--session", "curator", "whoami", ok=False)
 
     def test_same_name_closes_only_after_the_opener_ended(self):
-        a1, a2, h = self.session("asker"), self.session("asker"), self.session("helper")
+        a1, early, h = self.session("asker"), self.session("asker"), self.session("helper")
         self.kb("add", "--type", "request", "--to", "helper", "which port?", as_=a1)
         self.kb("claim", "1", as_=h)
         self.kb("note", "1", "--reply", "8080", as_=h)
-        self.kb("close", "1", as_=a2, ok=False)
+        self.kb("close", "1", as_=early, ok=False)
         self.kb("end", as_=a1)
-        self.kb("close", "1", as_=a2)
+        self.kb("close", "1", as_=early, ok=False)  # started before the opener ended
+        self.kb("close", "1", as_=self.session("asker"))
 
     def test_claimed_request_of_ended_session_reaches_successor(self):
         asker = self.session("asker")

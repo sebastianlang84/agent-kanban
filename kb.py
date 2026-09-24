@@ -163,11 +163,16 @@ def nearest_harness() -> str | None:
 
     Nested harnesses (a Codex call from a Claude session) inherit each other's
     environment, so the nearest ancestor decides which session id applies.
-    KB_HARNESS overrides the detection (`none` for no harness).
+    KB_HARNESS overrides the detection (`none` for no harness) for tests and odd setups;
+    it never makes a call the curator, see `curator_allowed`.
     """
     forced = os.environ.get("KB_HARNESS")
     if forced:
         return None if forced == "none" else forced
+    return harness_in_proc()
+
+
+def harness_in_proc() -> str | None:
     if not Path("/proc/self/stat").exists():
         return None
     pid, seen = os.getppid(), 0
@@ -221,6 +226,23 @@ def register(conn, harness: str, sid: str, cwd: str | None, name: str | None = N
     return conn.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
 
 
+def has_tty() -> bool:
+    try:
+        os.close(os.open("/dev/tty", os.O_RDWR))
+        return True
+    except OSError:
+        return False
+
+
+def curator_allowed() -> bool:
+    """The curator is a human at a terminal: no agent harness above, a controlling tty.
+
+    Agent tool shells have no controlling terminal. This is a guard against mistakes, not
+    authentication: any process of the same user can open the database directly.
+    """
+    return harness_in_proc() is None and has_tty()
+
+
 def curator_row(conn) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM sessions WHERE id=?", (CURATOR,)).fetchone()
     return row or register(conn, "human", CURATOR, os.getcwd(), CURATOR)
@@ -246,6 +268,9 @@ def current(conn, args) -> sqlite3.Row:
             f"inside {harness} but its session id is not visible; "
             "run `kb start --as <name>` and pass --session <token>"
         )
+    if not curator_allowed():
+        raise Refused("no session found, and only a human at a terminal acts as curator; "
+                      "run `kb start --as <name>` and pass --session <token>")
     return curator_row(conn)
 
 
@@ -318,12 +343,21 @@ def similar(a: str, b: str) -> bool:
 
 
 def is_opener(conn, me: sqlite3.Row, t: sqlite3.Row) -> bool:
-    """The session that opened t, or a session of the same name once that one has ended."""
+    """The session that opened t, or a same-name session started after that one ended.
+
+    The successor must not be the session that answered, so a same-name addressee cannot
+    close its own reply.
+    """
     if t["creator_session"] == me["id"]:
         return True
     creator = conn.execute("SELECT ended_at FROM sessions WHERE id=?",
                            (t["creator_session"],)).fetchone()
-    return me["name"] == t["creator_name"] and bool(creator and creator["ended_at"])
+    answered_by_me = conn.execute(
+        "SELECT 1 FROM notes WHERE ticket_id=? AND kind='reply' AND session_id=?",
+        (t["ticket_id"] if "ticket_id" in t.keys() else t["id"], me["id"]),
+    ).fetchone()
+    return (me["name"] == t["creator_name"] and bool(creator and creator["ended_at"])
+            and me["started_at"] > creator["ended_at"] and not answered_by_me)
 
 
 def is_name(me: sqlite3.Row, name: str | None) -> bool:

@@ -76,7 +76,10 @@ cannot carry the curator's approval.
 
 ## Curator and approvals
 
-A shell outside any agent harness acts as `curator`, the human. An agent waiting for an approval
+A shell outside any agent harness, with a controlling terminal, acts as `curator`, the human.
+Agent tool shells have no controlling terminal, so they cannot act as curator. This guards
+against mistakes; it is not authentication, since any process of the same user can open the
+database. An agent waiting for an approval
 (commit, merge, deletion) files it as `kb add --type request --to curator --label approval
 "<what>" --note "<exact command>"`. `kb board --to curator` lists pending approvals with their age;
 the curator claims one and replies.

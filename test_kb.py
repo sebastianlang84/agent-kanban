@@ -143,6 +143,40 @@ class Board(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertEqual(self.kb("sessions").stdout, "")
 
+    def test_session_id_is_not_a_token(self):
+        a = self.session("a")
+        self.kb("add", "task of a", "--claim", as_=a)
+        sid = self.kb("whoami", as_=a).stdout.split()[1]
+        self.assertIn("unknown session", self.kb("--session", sid, "whoami", ok=False).stderr)
+        self.kb("--session", "curator", "whoami", ok=False)
+
+    def test_same_name_closes_only_after_the_opener_ended(self):
+        a1, a2, h = self.session("asker"), self.session("asker"), self.session("helper")
+        self.kb("add", "--type", "request", "--to", "helper", "which port?", as_=a1)
+        self.kb("claim", "1", as_=h)
+        self.kb("note", "1", "--reply", "8080", as_=h)
+        self.kb("close", "1", as_=a2, ok=False)
+        self.kb("end", as_=a1)
+        self.kb("close", "1", as_=a2)
+
+    def test_claimed_request_of_ended_session_reaches_successor(self):
+        asker = self.session("asker")
+        self.hook("start", "claude", "old")  # named demo
+        env_old = {"KB_HARNESS": "claude", "CLAUDE_CODE_SESSION_ID": "old"}
+        self.kb("add", "--type", "request", "--to", "demo", "status please", as_=asker)
+        self.kb("claim", "1", env=env_old)
+        self.hook("end", "claude", "old")
+        start = json.loads(self.hook("start", "claude", "new"))["hookSpecificOutput"]
+        self.assertIn("request #1 from asker", start["additionalContext"])
+        self.assertIn("--take", start["additionalContext"])
+        self.kb("claim", "1", "--take", env={"KB_HARNESS": "claude",
+                                             "CLAUDE_CODE_SESSION_ID": "new"})
+
+    def test_similarity_spans_ticket_types(self):
+        a = self.session("a")
+        self.kb("add", "Fix login redirect", as_=a)
+        self.kb("add", "--type", "request", "--to", "b", "Fix login redirect", as_=a, ok=False)
+
     def test_harness_without_session_id_is_refused(self):
         r = self.kb("board", env={"KB_HARNESS": "codex"})  # board is read-only: allowed
         self.assertEqual(r.returncode, 0)

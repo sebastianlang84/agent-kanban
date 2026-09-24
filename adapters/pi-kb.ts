@@ -10,7 +10,7 @@ function hook(event: string, sessionId: string, cwd: string): string {
     return execFileSync("kb", ["hook", event, "--harness", "pi", "--format", "text"], {
       input: JSON.stringify({ session_id: sessionId, cwd }),
       encoding: "utf8",
-      timeout: 5000,
+      timeout: 3000,
     }).trim();
   } catch {
     return "";

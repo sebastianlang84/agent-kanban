@@ -85,12 +85,13 @@ class Refused(Exception):
 
 # --- storage -----------------------------------------------------------------
 
-def connect() -> sqlite3.Connection:
+def connect(wait: float = 10) -> sqlite3.Connection:
+    """Open the board; hooks pass a short wait so a held write lock never stalls a harness."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    conn = sqlite3.connect(DB_PATH, timeout=wait, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={int(wait * 1000)}")
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
     try:
@@ -229,7 +230,7 @@ def current(conn, args) -> sqlite3.Row:
     """Resolve the calling session: --session token, harness environment, else curator."""
     if getattr(args, "session", None):
         row = conn.execute(
-            "SELECT * FROM sessions WHERE token=? OR id=?", (args.session, args.session)
+            "SELECT * FROM sessions WHERE token=?", (args.session,)
         ).fetchone()
         if not row:
             raise Refused(f"unknown session {args.session!r}; run `kb start --as <name>`")
@@ -314,6 +315,15 @@ def similar(a: str, b: str) -> bool:
     wa, wb = words(a), words(b)
     jaccard = len(wa & wb) / len(wa | wb) if wa | wb else 0.0
     return ratio >= 0.75 or jaccard >= 0.6
+
+
+def is_opener(conn, me: sqlite3.Row, t: sqlite3.Row) -> bool:
+    """The session that opened t, or a session of the same name once that one has ended."""
+    if t["creator_session"] == me["id"]:
+        return True
+    creator = conn.execute("SELECT ended_at FROM sessions WHERE id=?",
+                           (t["creator_session"],)).fetchone()
+    return me["name"] == t["creator_name"] and bool(creator and creator["ended_at"])
 
 
 def is_name(me: sqlite3.Row, name: str | None) -> bool:
@@ -401,8 +411,8 @@ def cmd_add(conn, args) -> int:
         if not args.new:
             clash = [
                 t for t in conn.execute(
-                    "SELECT id, title FROM tickets WHERE status != 'closed' AND repo=? AND type=?",
-                    (repo, args.type),
+                    "SELECT id, title FROM tickets WHERE status != 'closed' AND repo=?",
+                    (repo,),
                 )
                 if similar(t["title"], title)
             ]
@@ -505,8 +515,9 @@ def cmd_close(conn, args) -> int:
             raise Refused(f"#{t['id']} is already closed")
         curator = me["id"] == CURATOR
         if t["type"] == "request":
-            if not (is_name(me, t["creator_name"]) or curator):
-                raise Refused(f"only {t['creator_name']}, who opened #{t['id']}, closes it")
+            if not (is_opener(conn, me, t) or curator):
+                raise Refused(f"only the session that opened #{t['id']} ({t['creator_name']}) "
+                              "closes it")
             if not has_reply(conn, t["id"]) and not args.withdraw:
                 raise Refused(f"#{t['id']} has no reply yet (use --withdraw to drop the request)")
             body = args.result or ("withdrawn" if args.withdraw and not has_reply(conn, t["id"])
@@ -585,20 +596,27 @@ def cmd_sessions(conn, args) -> int:
 def pending_for(conn, me: sqlite3.Row) -> list[tuple[str, str]]:
     """Unseen open requests addressed to this session and unseen replies to its requests."""
     items = []
+    # Open requests, and requests claimed by a session that ended before answering.
     for t in conn.execute(
-        "SELECT * FROM tickets WHERE type='request' AND status='open'"
-        " AND (to_name=? OR to_name='any') AND creator_session != ?",
+        "SELECT t.* FROM tickets t LEFT JOIN sessions o ON o.id = t.owner_session"
+        " WHERE t.type='request' AND (to_name=? OR to_name='any') AND creator_session != ?"
+        " AND (t.status='open' OR (t.status='claimed' AND o.ended_at IS NOT NULL"
+        "      AND NOT EXISTS (SELECT 1 FROM notes n WHERE n.ticket_id=t.id AND n.kind='reply')))",
         (me["name"], me["id"]),
     ):
-        items.append((f"t{t['id']}", f"request #{t['id']} from {t['creator_name']}: {t['title']}"))
+        take = " (left by an ended session: kb claim --take)" if t["status"] == "claimed" else ""
+        items.append((f"t{t['id']}", f"request #{t['id']} from {t['creator_name']}: "
+                                     f"{t['title']}{take}"))
     for n in conn.execute(
-        "SELECT n.id, n.ticket_id, n.author_name, t.title FROM notes n JOIN tickets t"
+        "SELECT n.id AS note_id, n.ticket_id, n.author_name, t.title, t.creator_session,"
+        " t.creator_name FROM notes n JOIN tickets t"
         " ON t.id = n.ticket_id WHERE n.kind='reply' AND t.status != 'closed'"
         " AND t.creator_name=?",
         (me["name"],),
     ):
-        items.append((f"n{n['id']}", f"reply on #{n['ticket_id']} from {n['author_name']}:"
-                                     f" {n['title']} (kb show {n['ticket_id']})"))
+        if is_opener(conn, me, n):
+            items.append((f"n{n['note_id']}", f"reply on #{n['ticket_id']} from {n['author_name']}:"
+                                         f" {n['title']} (kb show {n['ticket_id']})"))
     seen = {r["item"] for r in conn.execute(
         "SELECT item FROM shown WHERE session_id=?", (me["id"],))}
     return [i for i in items if i[0] not in seen]
@@ -758,7 +776,7 @@ def main(argv: list[str] | None = None) -> int:
         if os.environ.get("KB") == "0" or os.environ.get("BRAIN_SESSION_CONTEXT") == "0":
             return 0
         try:
-            return cmd_hook(connect(), args)
+            return cmd_hook(connect(wait=1), args)
         except Exception as exc:  # noqa: BLE001
             print(f"kb hook: {exc}", file=sys.stderr)
             return 0

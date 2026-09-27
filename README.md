@@ -91,7 +91,7 @@ its next prompt, in every harness. A request to a session that has ended waits; 
 session with that name sees it at start.
 
 To reach an idle session, run `kb-watch --for <name> [--exec CMD]` (in `~/.local/bin`): it
-waits on inotify events for the database (no polling; --interval is only a fallback) and prints one line per new note by others on tickets addressed to
+waits on inotify events for the database (no polling; no periodic check) and prints one line per new note by others on tickets addressed to
 `<name>` or `any`, opened or owned by `<name>`, or noted on by `<name>`, and runs CMD with
 `KB_TICKET`, `KB_NOTE`, `KB_AUTHOR`, `KB_KIND` and `KB_TITLE`. The Windows Claude session
 streams it through ssh; `kb-watch-orchestrator.service` wakes the Paperclip Orchestrator

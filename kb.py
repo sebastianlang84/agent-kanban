@@ -932,16 +932,26 @@ def max_note_id(conn) -> int:
     return conn.execute("SELECT coalesce(max(id), 0) FROM notes").fetchone()[0]
 
 
-def notify(before: int, after: int) -> None:
-    """Run every executable in <db dir>/notify.d once after a command added notes.
+def notify(after: int) -> None:
+    """Run every executable in <db dir>/notify.d once when notes were added since the last run.
 
     This is the push side: the writer itself starts the notifiers, so nothing has to watch the
-    database. Hooks run detached with KB_DB, KB_FIRST_NOTE and KB_LAST_NOTE set; they never block
-    or fail the kb command.
+    database. <db dir>/notify.last records the newest note hooks were started for; a kb process that
+    died between its commit and this call is caught up by the next kb command. Hooks run detached
+    with KB_DB, KB_FIRST_NOTE and KB_LAST_NOTE set; they never block or fail the kb command.
     """
     hook_dir = Path(DB_PATH).parent / "notify.d"
-    if after <= before or not hook_dir.is_dir():
+    if not hook_dir.is_dir():
         return
+    mark = hook_dir.parent / "notify.last"
+    try:
+        before = int(mark.read_text().strip() or 0)
+    except (OSError, ValueError):
+        mark.write_text(f"{after}\n")  # first run: start from now
+        return
+    if after <= before:
+        return
+    mark.write_text(f"{after}\n")
     env = {**os.environ, "KB_DB": str(DB_PATH), "KB_FIRST_NOTE": str(before + 1), "KB_LAST_NOTE": str(after)}
     for hook in sorted(hook_dir.iterdir()):
         if hook.is_file() and os.access(hook, os.X_OK):
@@ -965,10 +975,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
     try:
         conn = connect()
-        before = max_note_id(conn)
         release_stale(conn)
         rc = COMMANDS[args.cmd](conn, args)
-        notify(before, max_note_id(conn))
+        notify(max_note_id(conn))
         return rc
     except Refused as exc:
         print(f"kb: {exc}", file=sys.stderr)

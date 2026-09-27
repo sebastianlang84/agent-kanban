@@ -343,20 +343,23 @@ def release_stale(conn, now: float | None = None) -> list[int]:
     hook refreshes it) or its owner runs `kb touch`.
     """
     now = now or time.time()
-    rows = conn.execute(
-        "SELECT t.id, t.owner_name, s.ended_at, t.last_activity FROM tickets t"
+    stale_sql = (
+        "SELECT t.id, t.owner_name, t.owner_session, s.ended_at, t.last_activity FROM tickets t"
         " LEFT JOIN sessions s ON s.id = t.owner_session"
-        " WHERE t.status='claimed' AND (s.ended_at IS NOT NULL OR t.last_activity < ?)",
-        (now - DAY,),
-    ).fetchall()
-    if not rows:
+        " WHERE t.status='claimed' AND (s.ended_at IS NOT NULL OR t.last_activity < ?)"
+    )
+    # A cheap read first, so the common case takes no write lock.
+    if not conn.execute(stale_sql, (now - DAY,)).fetchone():
         return []
     released = []
     with tx(conn):
-        for r in rows:
+        # Re-select inside the write transaction: a claim taken over or touched meanwhile
+        # no longer matches, and the update is guarded by owner and activity time as well.
+        for r in conn.execute(stale_sql, (now - DAY,)).fetchall():
             changed = conn.execute(
                 "UPDATE tickets SET status='open', owner_session=NULL, owner_name=NULL,"
-                " claimed_at=NULL WHERE id=? AND status='claimed'", (r["id"],)
+                " claimed_at=NULL WHERE id=? AND status='claimed' AND owner_session IS ?"
+                " AND last_activity=?", (r["id"], r["owner_session"], r["last_activity"])
             ).rowcount
             if changed:
                 why = "session-ended" if r["ended_at"] else "idle>24h"
@@ -424,7 +427,8 @@ def cmd_board(conn, args) -> int:
         f"SELECT * FROM tickets WHERE {' AND '.join(where)} ORDER BY created_at", params
     ).fetchall()
     hidden = 0
-    if not (args.all or args.label == "backlog"):
+    # Requests (approvals, questions) are never hidden: --to lists everything waiting.
+    if not (args.all or args.to or args.label == "backlog"):
         hidden = sum(1 for t in rows if is_backlog(t))
         rows = [t for t in rows if not is_backlog(t)]
     items = []
@@ -639,6 +643,8 @@ def cmd_label(conn, args) -> int:
         labels = {l for l in (t["labels"] or "").split(",") if l}
         labels |= {l.strip().lstrip("+") for l in args.add if l.strip().lstrip("+")}
         labels -= {l.strip() for l in args.remove or []}
+        if "backlog" in labels and t["type"] == "request":
+            raise Refused("requests cannot go to the backlog; answer or withdraw them")
         new = ",".join(sorted(labels))
         if new != (t["labels"] or ""):
             conn.execute("UPDATE tickets SET labels=? WHERE id=?", (new, t["id"]))

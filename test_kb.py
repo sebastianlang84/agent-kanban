@@ -186,6 +186,9 @@ class Board(unittest.TestCase):
         self.kb("label", "1", "--remove", "backlog", as_=a)
         self.assertIn("idea for later", self.kb("board").stdout)
         self.kb("label", "1", as_=a, ok=False)
+        self.kb("add", "--type", "request", "--to", "curator", "approve deploy", as_=a)
+        self.kb("label", "3", "backlog", as_=a, ok=False)  # requests never hide
+        self.assertIn("approve deploy", self.kb("board", "--to", "curator").stdout)
 
     def test_backup_writes_a_readable_copy(self):
         a = self.session("a")

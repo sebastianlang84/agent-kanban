@@ -90,12 +90,25 @@ The prompt hook shows a session its new requests and new replies on its own requ
 its next prompt, in every harness. A request to a session that has ended waits; the next
 session with that name sees it at start.
 
+### Push on write (notify.d)
+
+After every command that added notes, `kb.py` starts each executable in
+`<db dir>/notify.d/` once, detached, with `KB_DB`, `KB_FIRST_NOTE` and `KB_LAST_NOTE` set. The writer
+itself raises the notification, so no process has to watch the database. On beelink,
+`notify.d/10-orchestrator` runs `kb-watch --for orchestrator --once --exec kb-wake-orchestrator`
+(filter and cursor from kb-watch, retries after 10/30/60 s). `kb-watch` without `--once` remains for
+subscribers that keep a connection open.
+
 To reach an idle session, run `kb-watch --for <name> [--exec CMD]` (in `~/.local/bin`): it
 waits on inotify events for the database (no polling; no periodic check) and prints one line per new note by others on tickets addressed to
 `<name>` or `any`, opened or owned by `<name>`, or noted on by `<name>`, and runs CMD with
 `KB_TICKET`, `KB_NOTE`, `KB_AUTHOR`, `KB_KIND` and `KB_TITLE`. The Windows Claude session
 streams it through ssh; `kb-watch-orchestrator.service` wakes the Paperclip Orchestrator
 through its API (`kb-wake-orchestrator`).
+
+Long-running commands over `ssh host 'cmd'` (no tty) get no SIGHUP when the client drops and
+linger forever. kb-watch exits on POLLHUP of its stdout itself; wrap any other follower
+(`journalctl -f`, `docker logs -f`, `tail -f`, loops) in `~/.local/bin/hup-guard [--max SECONDS] CMD`.
 
 ## Stale claims, backlog, backup
 

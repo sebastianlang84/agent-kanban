@@ -928,6 +928,30 @@ COMMANDS = {
 }
 
 
+def max_note_id(conn) -> int:
+    return conn.execute("SELECT coalesce(max(id), 0) FROM notes").fetchone()[0]
+
+
+def notify(before: int, after: int) -> None:
+    """Run every executable in <db dir>/notify.d once after a command added notes.
+
+    This is the push side: the writer itself starts the notifiers, so nothing has to watch the
+    database. Hooks run detached with KB_DB, KB_FIRST_NOTE and KB_LAST_NOTE set; they never block
+    or fail the kb command.
+    """
+    hook_dir = Path(DB_PATH).parent / "notify.d"
+    if after <= before or not hook_dir.is_dir():
+        return
+    env = {**os.environ, "KB_DB": str(DB_PATH), "KB_FIRST_NOTE": str(before + 1), "KB_LAST_NOTE": str(after)}
+    for hook in sorted(hook_dir.iterdir()):
+        if hook.is_file() and os.access(hook, os.X_OK):
+            try:
+                subprocess.Popen([str(hook)], env=env, start_new_session=True, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError as exc:
+                print(f"kb: notify hook {hook.name} failed to start: {exc}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.cmd == "hook":
@@ -941,8 +965,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
     try:
         conn = connect()
+        before = max_note_id(conn)
         release_stale(conn)
-        return COMMANDS[args.cmd](conn, args)
+        rc = COMMANDS[args.cmd](conn, args)
+        notify(before, max_note_id(conn))
+        return rc
     except Refused as exc:
         print(f"kb: {exc}", file=sys.stderr)
         return 1

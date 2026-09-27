@@ -117,10 +117,9 @@ class Board(unittest.TestCase):
         self.kb("add", "--type", "request", "--to", "demo", "check the import", as_=a)
         self.kb("claim", "1", as_=b)
         self.kb("note", "1", "--reply", "done", as_=b)
+        self.kb("close", "1", as_=b, ok=False)  # the opener is still active
         self.kb("end", as_=a)
-        self.kb("close", "1", as_=b, ok=False)
-        c = self.session("demo")
-        self.kb("close", "1", as_=c)
+        self.kb("close", "1", as_=b)  # the answering session closes once the opener ended
 
     def test_hooks_register_notify_and_flag(self):
         start = json.loads(self.hook("start", "claude", "s1"))
@@ -136,10 +135,10 @@ class Board(unittest.TestCase):
                                                          "CLAUDE_CODE_SESSION_ID": "s1"})
         self.hook("stop", "claude", "s1")
         self.hook("end", "claude", "s1")
-        self.assertIn("session-ended", self.kb("board").stdout)
         start = json.loads(self.hook("start", "codex", "t2"))["hookSpecificOutput"]
-        self.assertIn("left open by an ended session: #2", start["additionalContext"])
-        self.kb("claim", "2", "--take", env={"KB_HARNESS": "codex", "CODEX_THREAD_ID": "t2"})
+        self.assertIn("released from a stale claim, open to take: #2", start["additionalContext"])
+        self.assertIn("released: stale (session-ended), owner demo", self.kb("show", "2").stdout)
+        self.kb("claim", "2", env={"KB_HARNESS": "codex", "CODEX_THREAD_ID": "t2"})
 
     def test_reply_reaches_the_opener(self):
         self.hook("start", "pi", "p1")
@@ -159,10 +158,43 @@ class Board(unittest.TestCase):
         with sqlite3.connect(self.db) as c:
             c.execute("UPDATE tickets SET last_activity=?, created_at=?", (old, old))
         board = self.kb("board").stdout
-        self.assertIn("idle>24h", board)
+        self.assertNotIn("idle>24h", board)  # an idle claim is released automatically
         self.assertIn("waiting>24h", board)
+        self.assertIn("released: stale (idle>24h), owner a", self.kb("show", "1").stdout)
         b = self.session("b")
-        self.kb("claim", "1", "--take", as_=b)
+        self.kb("claim", "1", as_=b)
+
+    def test_touch_keeps_a_long_claim(self):
+        a = self.session("a")
+        self.kb("add", "long task", "--claim", as_=a)
+        with sqlite3.connect(self.db) as c:
+            c.execute("UPDATE tickets SET last_activity=?", (time.time() - 23 * 3600,))
+        self.kb("touch", "1", as_=a)
+        self.kb("touch", "1", as_=self.session("b"), ok=False)
+        self.assertIn("@a", self.kb("board").stdout)
+
+    def test_backlog_is_hidden_from_the_board(self):
+        a = self.session("a")
+        self.kb("add", "idea for later", as_=a)
+        self.kb("add", "urgent fix", as_=a)
+        self.kb("label", "1", "backlog", as_=a)
+        board = self.kb("board").stdout
+        self.assertNotIn("idea for later", board)
+        self.assertIn("1 backlog tickets hidden", board)
+        self.assertIn("idea for later", self.kb("board", "--label", "backlog").stdout)
+        self.assertIn("idea for later", self.kb("board", "--all").stdout)
+        self.kb("label", "1", "--remove", "backlog", as_=a)
+        self.assertIn("idea for later", self.kb("board").stdout)
+        self.kb("label", "1", as_=a, ok=False)
+
+    def test_backup_writes_a_readable_copy(self):
+        a = self.session("a")
+        self.kb("add", "keep me", as_=a)
+        out = Path(self.tmp.name) / "bk"
+        self.kb("backup", "--dir", str(out))
+        (copy,) = out.glob("kb-*.sqlite")
+        with sqlite3.connect(copy) as c:
+            self.assertEqual(c.execute("SELECT title FROM tickets").fetchone()[0], "keep me")
 
     def test_hooks_never_fail_and_respect_opt_out(self):
         self.assertEqual(self.kb("hook", "start", "--harness", "claude", stdin="not json").stdout, "")
@@ -196,9 +228,7 @@ class Board(unittest.TestCase):
         self.hook("end", "claude", "old")
         start = json.loads(self.hook("start", "claude", "new"))["hookSpecificOutput"]
         self.assertIn("request #1 from asker", start["additionalContext"])
-        self.assertIn("--take", start["additionalContext"])
-        self.kb("claim", "1", "--take", env={"KB_HARNESS": "claude",
-                                             "CLAUDE_CODE_SESSION_ID": "new"})
+        self.kb("claim", "1", env={"KB_HARNESS": "claude", "CLAUDE_CODE_SESSION_ID": "new"})
 
     def test_similarity_spans_ticket_types(self):
         a = self.session("a")

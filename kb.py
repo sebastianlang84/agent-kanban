@@ -331,6 +331,45 @@ def flags(conn, t: sqlite3.Row, now: float) -> list[str]:
     return out
 
 
+SYSTEM = {"id": "kb", "name": "kb"}  # author of automatic notes
+
+
+def release_stale(conn, now: float | None = None) -> list[int]:
+    """Give back claims whose owner session ended or that saw no activity for 24 h.
+
+    An ended session cannot finish its work, and an idle claim blocks everyone else. Each
+    release leaves an event note naming the reason and the former owner, so the history
+    stays readable. A long task stays claimed as long as its session is active (the stop
+    hook refreshes it) or its owner runs `kb touch`.
+    """
+    now = now or time.time()
+    rows = conn.execute(
+        "SELECT t.id, t.owner_name, s.ended_at, t.last_activity FROM tickets t"
+        " LEFT JOIN sessions s ON s.id = t.owner_session"
+        " WHERE t.status='claimed' AND (s.ended_at IS NOT NULL OR t.last_activity < ?)",
+        (now - DAY,),
+    ).fetchall()
+    if not rows:
+        return []
+    released = []
+    with tx(conn):
+        for r in rows:
+            changed = conn.execute(
+                "UPDATE tickets SET status='open', owner_session=NULL, owner_name=NULL,"
+                " claimed_at=NULL WHERE id=? AND status='claimed'", (r["id"],)
+            ).rowcount
+            if changed:
+                why = "session-ended" if r["ended_at"] else "idle>24h"
+                add_note(conn, r["id"], SYSTEM, "event",
+                         f"released: stale ({why}), owner {r['owner_name']}")
+                released.append(r["id"])
+    return released
+
+
+def is_backlog(t: sqlite3.Row) -> bool:
+    return "backlog" in (t["labels"] or "").split(",")
+
+
 def words(title: str) -> set[str]:
     return {w for w in re.findall(r"[\w-]+", title.lower()) if len(w) > 2}
 
@@ -384,6 +423,10 @@ def cmd_board(conn, args) -> int:
     rows = conn.execute(
         f"SELECT * FROM tickets WHERE {' AND '.join(where)} ORDER BY created_at", params
     ).fetchall()
+    hidden = 0
+    if not (args.all or args.label == "backlog"):
+        hidden = sum(1 for t in rows if is_backlog(t))
+        rows = [t for t in rows if not is_backlog(t)]
     items = []
     for t in rows:
         items.append({
@@ -398,7 +441,8 @@ def cmd_board(conn, args) -> int:
         print()
         return 0
     if not items:
-        print("board empty" + (f" for {args.repo}" if args.repo else ""))
+        print("board empty" + (f" for {args.repo}" if args.repo else "")
+              + (f" ({hidden} backlog tickets hidden)" if hidden else ""))
         return 0
     for i in items:
         who = i["owner"] and f"@{i['owner']} {i['since']}" or "unclaimed"
@@ -408,6 +452,8 @@ def cmd_board(conn, args) -> int:
         kind = "REQ" if i["type"] == "request" else "task"
         print(f"#{i['id']:<4} {kind:<4} {i['status']:<7} {i['age']:>4}  {i['repo']:<14}"
               f" {who}{route}{tag}  {i['title']}{label}")
+    if hidden:
+        print(f"({hidden} backlog tickets hidden: kb board --label backlog)")
     return 0
 
 
@@ -551,9 +597,15 @@ def cmd_close(conn, args) -> int:
             raise Refused(f"#{t['id']} is already closed")
         curator = me["id"] == CURATOR
         if t["type"] == "request":
-            if not (is_opener(conn, me, t) or curator):
+            creator = conn.execute("SELECT ended_at FROM sessions WHERE id=?",
+                                   (t["creator_session"],)).fetchone()
+            # The opener reads the reply first; once the opener has ended, the session that
+            # answered may close, so answered requests do not stay open forever.
+            answerer = (t["owner_session"] == me["id"] and has_reply(conn, t["id"])
+                        and bool(creator and creator["ended_at"]))
+            if not (is_opener(conn, me, t) or curator or answerer):
                 raise Refused(f"only the session that opened #{t['id']} ({t['creator_name']}) "
-                              "closes it")
+                              "closes it, or the answering session after the opener ended")
             if not has_reply(conn, t["id"]) and not args.withdraw:
                 raise Refused(f"#{t['id']} has no reply yet (use --withdraw to drop the request)")
             body = args.result or ("withdrawn" if args.withdraw and not has_reply(conn, t["id"])
@@ -574,6 +626,55 @@ def cmd_close(conn, args) -> int:
         conn.execute("UPDATE tickets SET status='closed', closed_at=? WHERE id=?",
                      (time.time(), t["id"]))
     print(f"#{args.id} closed")
+    return 0
+
+
+def cmd_label(conn, args) -> int:
+    """Add or remove labels, e.g. `kb label 12 backlog` and `kb label 12 --remove backlog`."""
+    me = current(conn, args)
+    if not (args.add or args.remove):
+        raise Refused("name labels to add, or --remove <label>")
+    with tx(conn):
+        t = get_ticket(conn, args.id)
+        labels = {l for l in (t["labels"] or "").split(",") if l}
+        labels |= {l.strip().lstrip("+") for l in args.add if l.strip().lstrip("+")}
+        labels -= {l.strip() for l in args.remove or []}
+        new = ",".join(sorted(labels))
+        if new != (t["labels"] or ""):
+            conn.execute("UPDATE tickets SET labels=? WHERE id=?", (new, t["id"]))
+            add_note(conn, t["id"], me, "event", f"labels: {new or '-'}")
+    print(f"#{args.id} labels: {new or '-'}")
+    return 0
+
+
+def cmd_touch(conn, args) -> int:
+    """Record activity on your claimed ticket, so a long task is not released as idle."""
+    me = current(conn, args)
+    changed = conn.execute(
+        "UPDATE tickets SET last_activity=? WHERE id=? AND owner_session=? AND status='claimed'",
+        (time.time(), args.id, me["id"]),
+    ).rowcount
+    if not changed:
+        raise Refused(f"#{args.id} is not claimed by you")
+    print(f"#{args.id} touched")
+    return 0
+
+
+def cmd_backup(conn, args) -> int:
+    """Write a consistent copy of the board; keep the newest --keep daily copies."""
+    target_dir = Path(args.dir) if args.dir else DB_PATH.parent / "backups"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(target_dir, 0o700)
+    target = target_dir / f"kb-{time.strftime('%Y%m%d')}.sqlite"
+    dest = sqlite3.connect(target)
+    try:
+        conn.backup(dest)
+    finally:
+        dest.close()
+    os.chmod(target, 0o600)
+    for old in sorted(target_dir.glob("kb-*.sqlite"))[:-args.keep]:
+        old.unlink()
+    print(f"backup: {target}")
     return 0
 
 
@@ -695,16 +796,19 @@ def cmd_hook(conn, args) -> int:
     now = time.time()
     if args.event == "start":
         me = register(conn, args.harness, sid, cwd)
+        release_stale(conn, now)
         items = pending_for(conn, me)
         mark_shown(conn, me, items)
         left = conn.execute(
-            "SELECT t.id, t.title, t.owner_name FROM tickets t JOIN sessions s"
-            " ON s.id = t.owner_session WHERE t.status='claimed' AND s.ended_at IS NOT NULL"
-            " AND t.repo=?", (me["repo"],),
+            "SELECT DISTINCT t.id, t.title FROM tickets t JOIN notes n ON n.ticket_id = t.id"
+            " WHERE t.status='open' AND t.type='task' AND t.repo=? AND n.kind='event'"
+            " AND n.body LIKE 'released: stale%' AND n.created_at > ?",
+            (me["repo"], now - DAY),
         ).fetchall()
         lines = [f"kb: this session is `{me['name']}` on the shared board (`kb board`)."]
         lines += [f"- {text}" for _, text in items]
-        lines += [f"- left open by an ended session: #{t['id']} {t['title']}" for t in left]
+        lines += [f"- released from a stale claim, open to take: #{t['id']} {t['title']}"
+                  for t in left]
         if items:
             lines.append(DATA_NOTE)
         emit(args.format, "SessionStart", "\n".join(lines))
@@ -739,6 +843,7 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--to", help="requests waiting for this session name")
     s.add_argument("--label")
     s.add_argument("--closed", type=float, metavar="DAYS", help="closed in the last DAYS days")
+    s.add_argument("--all", action="store_true", help="include backlog tickets")
     s.add_argument("--json", action="store_true")
 
     s = sub.add_parser("show", help="one ticket with its notes")
@@ -776,6 +881,18 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--result", help="request: optional closing note")
     s.add_argument("--withdraw", action="store_true", help="request: close without a reply")
 
+    s = sub.add_parser("label", help="add labels, or remove them with --remove")
+    s.add_argument("id", type=int)
+    s.add_argument("add", nargs="*", help="labels to add, e.g. backlog")
+    s.add_argument("--remove", action="append", help="label to remove (repeatable)")
+
+    s = sub.add_parser("touch", help="record activity on your claimed ticket")
+    s.add_argument("id", type=int)
+
+    s = sub.add_parser("backup", help="write a consistent copy of the board")
+    s.add_argument("--dir", help="default: backups/ next to the database")
+    s.add_argument("--keep", type=int, default=14)
+
     s = sub.add_parser("start", help="register a session without hooks; prints its token")
     s.add_argument("--as", dest="as_name", required=True)
     s.add_argument("--cwd")
@@ -801,7 +918,7 @@ COMMANDS = {
     "board": cmd_board, "show": cmd_show, "add": cmd_add, "claim": cmd_claim,
     "release": cmd_release, "note": cmd_note, "close": cmd_close, "start": cmd_start,
     "end": cmd_end, "name": cmd_name, "whoami": cmd_whoami, "sessions": cmd_sessions,
-    "hook": cmd_hook,
+    "label": cmd_label, "touch": cmd_touch, "backup": cmd_backup, "hook": cmd_hook,
 }
 
 
@@ -817,7 +934,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"kb hook: {exc}", file=sys.stderr)
             return 0
     try:
-        return COMMANDS[args.cmd](connect(), args)
+        conn = connect()
+        release_stale(conn)
+        return COMMANDS[args.cmd](conn, args)
     except Refused as exc:
         print(f"kb: {exc}", file=sys.stderr)
         return 1

@@ -87,15 +87,33 @@ the curator claims one and replies.
 ## Notification
 
 The prompt hook shows a session its new requests and new replies on its own requests once, at
-its next prompt, in every harness. An idle session is not reached; a human tells it to look. A
-request to a session that has ended waits; the next session with that name sees it at start.
+its next prompt, in every harness. A request to a session that has ended waits; the next
+session with that name sees it at start.
+
+To reach an idle session, run `kb-watch --for <name> [--exec CMD]` (in `~/.local/bin`): it
+polls the database and prints one line per new note by others on tickets addressed to
+`<name>` or `any`, opened or owned by `<name>`, or noted on by `<name>`, and runs CMD with
+`KB_TICKET`, `KB_NOTE`, `KB_AUTHOR`, `KB_KIND` and `KB_TITLE`. The Windows Claude session
+streams it through ssh; `kb-watch-orchestrator.service` wakes the Paperclip Orchestrator
+through its API (`kb-wake-orchestrator`).
+
+## Stale claims, backlog, backup
+
+- Every `kb` call releases claims whose session ended or that saw no activity for 24 hours,
+  with an event note `released: stale (<reason>), owner <name>`. The start hook lists such
+  tickets of the repository. Keep a long task with `kb touch <id>`.
+- `kb label <id> backlog` parks an idea; `kb board` hides backlog tickets (`--label backlog`
+  or `--all` shows them); `kb label <id> --remove backlog` brings it back.
+- `kb backup [--dir D] [--keep 14]` writes a consistent copy (default `backups/` next to the
+  database); `kb-backup.timer` runs it daily.
+- An answered request can be closed by the answering session once the opener has ended.
 
 ## Board flags
 
 | Flag            | Meaning                                  |
 |-----------------|------------------------------------------|
-| `idle>24h`      | claimed, but no activity for 24 hours    |
-| `session-ended` | the owning session ended without closing |
+| `idle>24h`      | claimed, no activity for 24 h (released at the next `kb` call) |
+| `session-ended` | owning session ended (released at the next `kb` call) |
 | `waiting>24h`   | ticket not taken for 24 hours            |
 | `answered`      | request replied to, not yet closed       |
 

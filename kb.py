@@ -512,6 +512,9 @@ def cmd_add(conn, args) -> int:
         tid = cur.lastrowid
         if args.note:
             add_note(conn, tid, me, "note", args.note)
+        elif args.type == "request":
+            # notify.d hooks and kb-watch react to notes only; without one a request stays unnoticed.
+            add_note(conn, tid, me, "note", "(request text is in the title)")
         if args.claim and args.type == "task":
             conn.execute(
                 "UPDATE tickets SET status='claimed', owner_session=?, owner_name=?, claimed_at=?"

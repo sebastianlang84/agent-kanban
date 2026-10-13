@@ -3988,6 +3988,7 @@ def notify():
             return
         hook_env = dict(os.environ, KB_DB=board_file(), KB_FIRST_NOTE=str(before + 1),
                         KB_LAST_NOTE=str(after))
+        started = True
         for name in sorted(os.listdir(folder)):
             path = os.path.join(folder, name)
             if os.path.isfile(path) and os.access(path, os.X_OK):
@@ -3996,8 +3997,10 @@ def notify():
                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
                 except OSError as e:
+                    started = False  # the range stays pending for the next command
                     sys.stderr.write('kb: notify hook %s failed to start: %s\n' % (name, e))
-        write_atomic(mark, '%d\n' % after)
+        if started:
+            write_atomic(mark, '%d\n' % after)
 
 
 def notify_init():
@@ -4015,11 +4018,20 @@ def notify_init():
 
 
 def max_note_id():
-    """The newest note id, read-only; None without a readable board."""
+    """The newest note id, read-only: 0 for a board not created yet, the old table's for a
+    beelink board not imported yet (the import keeps note ids); None if unreadable."""
+    path = board_file()
+    if not os.path.exists(path):
+        return 0
     try:
-        conn = sqlite3.connect('file:%s?mode=ro' % urllib.parse.quote(board_file()), uri=True)
+        conn = sqlite3.connect('file:%s?mode=ro' % urllib.parse.quote(path), uri=True)
         try:
-            return conn.execute('SELECT coalesce(max(id), 0) FROM note').fetchone()[0]
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master"
+                                                 " WHERE type='table'")}
+            table = 'note' if 'note' in tables else 'notes' if 'notes' in tables else None
+            if table is None:
+                return 0
+            return conn.execute('SELECT coalesce(max(id), 0) FROM %s' % table).fetchone()[0]
         finally:
             conn.close()
     except sqlite3.Error:

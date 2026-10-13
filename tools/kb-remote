@@ -13,12 +13,12 @@ Each agent keeps one persistent kb session; its token stays on this host.
 import json, os, shlex, subprocess, sys
 from pathlib import Path
 
-KB = "/home/wasti/dev/agent-kanban/kb.py"
+KB = "/home/wasti/dev/agent-kanban/kb"
 NAME = sys.argv[1] if len(sys.argv) > 1 else "orchestrator"
 if not NAME.replace("-", "").isalnum():
     sys.exit("kb-remote: bad session name")
 TOKEN_FILE = Path.home() / f".agents/state/kb/{NAME}.token"
-ALLOWED = {"board", "show", "add", "claim", "release", "note", "close", "whoami", "sessions", "touch", "label", "--help", "-h"}
+ALLOWED = {"board", "show", "add", "claim", "release", "block", "resume", "abandon", "reopen", "note", "close", "whoami", "sessions", "touch", "label", "--help", "-h"}
 
 args = shlex.split(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
 if args[:1] == ["kb"]:

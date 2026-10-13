@@ -19,19 +19,25 @@ not repeat old notes. The first run starts at the newest note.
 
 Usage: kb-watch --for NAME [--interval 0] [--once | --until-first] [--exec CMD]
 """
-import argparse, ctypes, json, os, select, sqlite3, stat, struct, subprocess, sys, time
+import argparse, ctypes, datetime, json, os, select, sqlite3, stat, struct, subprocess, sys, time
 from pathlib import Path
 
 DB = Path(os.environ.get("KB_DB", Path.home() / ".agents/state/kb/kb.sqlite"))
 
 QUERY = """
-SELECT n.id, n.ticket_id, n.author_name, n.kind, t.title
-FROM notes n JOIN tickets t ON t.id = n.ticket_id
-WHERE n.id > :last AND n.author_name != :name AND n.kind != 'event'
-  AND n.author_name NOT IN (SELECT value FROM json_each(:ignore))
-  AND (t.to_name = :name OR (t.to_name = 'any' AND :any) OR t.to_name IN (SELECT value FROM json_each(:also))
-       OR t.creator_name = :name OR t.owner_name = :name
-       OR EXISTS (SELECT 1 FROM notes m WHERE m.ticket_id = t.id AND m.author_name = :name))
+SELECT n.id, n.ticket_id, author.name, n.kind, t.title
+FROM note n JOIN ticket t ON t.id = n.ticket_id
+JOIN session author ON author.token = n.author
+JOIN session opener ON opener.token = t.opener
+LEFT JOIN session assignee ON assignee.token = t.assignee
+WHERE n.id > :last AND author.name != :name
+  AND n.kind NOT IN ('event', 'session-ended')
+  AND author.name NOT IN (SELECT value FROM json_each(:ignore))
+  AND (t.addressee = :name OR (t.addressee = 'any' AND :any)
+       OR t.addressee IN (SELECT value FROM json_each(:also))
+       OR opener.name = :name OR assignee.name = :name
+       OR EXISTS (SELECT 1 FROM note m JOIN session writer ON writer.token = m.author
+                  WHERE m.ticket_id = t.id AND writer.name = :name))
 ORDER BY n.id
 """
 
@@ -57,7 +63,7 @@ class Waiter:
         except (OSError, AttributeError):
             pass
 
-    def wait(self, timeout: float | None) -> None:
+    def wait(self, timeout: float = None) -> None:
         if self.fd < 0:
             time.sleep(timeout or 20)  # no inotify: polling is the only option
             return
@@ -109,7 +115,7 @@ def main() -> int:
         # No cursor yet: a notify hook passes the first new note, so that note is not skipped.
         first = os.environ.get("KB_FIRST_NOTE", "")
         last = (int(first) - 1 if first.isdigit()
-                else conn.execute("SELECT coalesce(max(id), 0) FROM notes").fetchone()[0])
+                else conn.execute("SELECT coalesce(max(id), 0) FROM note").fetchone()[0])
         state.write_text(f"{last}\n")
 
     also = json.dumps([n for n in a.also_to.split(",") if n])
@@ -125,8 +131,10 @@ def main() -> int:
             conn.close()
             conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
             inode = DB.stat().st_ino
-            last = conn.execute("SELECT coalesce(max(id), 0) FROM notes WHERE created_at <= ?",
-                                (seen_at,)).fetchone()[0]
+            seen_before = datetime.datetime.fromtimestamp(seen_at, datetime.timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+            last = conn.execute("SELECT coalesce(max(id), 0) FROM note WHERE time <= ?",
+                                (seen_before,)).fetchone()[0]
             state.write_text(f"{last}\n")
         seen_at = time.time()
         rows = conn.execute(QUERY, {"last": last, "name": a.name, "also": also, "ignore": ignore, "any": 0 if a.no_any else 1}).fetchall()

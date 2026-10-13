@@ -579,6 +579,13 @@ def migrate_legacy(conn):
         conn.execute('DROP TABLE IF EXISTS %s' % table)
     conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('tickets', 'notes')")
     conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('legacy_import', ?)", (now(),))
+    # Hints cover events after the import only. hints_since compares whole seconds, so the
+    # newest imported ids are recorded too: an imported request or reply of the import's own
+    # second is never hinted again.
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('hints_since', ?)", (now(),))
+    for key, table in (('legacy_last_ticket', 'ticket'), ('legacy_last_note', 'note')):
+        conn.execute('INSERT OR REPLACE INTO meta (key, value) SELECT ?, coalesce(max(id), 0)'
+                     ' FROM %s' % table, (key,))
 
 
 def connect(busy_ms=10000):
@@ -1430,17 +1437,22 @@ def prompt_hints(conn, token, name):
     """
     row = conn.execute("SELECT value FROM meta WHERE key='hints_since'").fetchone()
     since = row[0] if row else now()
+    imported = dict(conn.execute("SELECT key, CAST(value AS INTEGER) FROM meta"
+                                 " WHERE key IN ('legacy_last_ticket', 'legacy_last_note')"))
+    last_ticket = imported.get('legacy_last_ticket', 0)
+    last_note = imported.get('legacy_last_note', 0)
     seen = {r[0] for r in conn.execute('SELECT item FROM hint_seen WHERE name=?', (name,))}
     asked = [r for r in conn.execute(
         "SELECT t.id, t.title, slabel(s.name, s.harness, s.token), t.addressee FROM ticket t"
         " JOIN session s ON s.token=t.opener WHERE t.type='request' AND t.status='todo'"
         " AND t.assignee IS NULL AND t.addressee IN (?, 'any') AND t.opener<>? AND t.created>=?"
-        " ORDER BY t.id", (name, token, since)) if 'ticket:%d' % r[0] not in seen]
+        " AND t.id>? ORDER BY t.id", (name, token, since, last_ticket)) if 'ticket:%d' % r[0] not in seen]
     replies = [r for r in conn.execute(
         "SELECT n.id, t.id, t.title, slabel(a.name, a.harness, a.token), t.status FROM note n"
         " JOIN ticket t ON t.id=n.ticket_id JOIN session o ON o.token=t.opener"
         " JOIN session a ON a.token=n.author WHERE n.kind='reply' AND t.type='request'"
-        " AND o.name=? AND n.author<>t.opener AND n.time>=? ORDER BY n.id", (name, since))
+        " AND o.name=? AND n.author<>t.opener AND n.time>=? AND n.id>? ORDER BY n.id",
+        (name, since, last_note))
         if 'note:%d' % r[0] not in seen]
     # Keyed by the latest reply and by the claim: a new event reminds again, a prompt never does.
     answered = [r for r in conn.execute(

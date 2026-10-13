@@ -1,10 +1,10 @@
 #!/bin/sh
 # kb for the concierge agent: its own session and only the board commands it needs.
 case "$1" in
-  show|board|claim|release|note|add|close|touch|whoami|sessions|label|--help|-h) ;;
-  *) echo "kb-concierge: command not allowed: $1 (allowed: show board claim release note add close touch whoami sessions label)" >&2; exit 2;;
+  show|board|claim|release|block|resume|abandon|reopen|note|add|close|touch|whoami|sessions|label|--help|-h) ;;
+  *) echo "kb-concierge: command not allowed: $1 (allowed: show board claim release block resume abandon reopen note add close touch whoami sessions label)" >&2; exit 2;;
 esac
 for a in "$@"; do
   case "$a" in --session|--session=*|--take) echo "kb-concierge: $a not allowed" >&2; exit 2;; esac
 done
-exec python3 "$HOME/dev/agent-kanban/kb.py" --session "$(cat "$HOME/.agents/state/kb/concierge.token")" "$@"
+exec python3 "$HOME/dev/agent-kanban/kb" --session "$(cat "$HOME/.agents/state/kb/concierge.token")" "$@"

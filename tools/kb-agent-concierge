@@ -16,7 +16,7 @@ import datetime, json, os, re, sqlite3, subprocess, sys, time
 from pathlib import Path
 
 HOME = Path.home()
-KB = HOME / "dev/agent-kanban/kb.py"
+KB = HOME / "dev/agent-kanban/kb"
 DB = Path(os.environ.get("KB_DB") or HOME / ".agents/state/kb/kb.sqlite")
 STATE = HOME / ".agents/state/kb"
 TOKEN = STATE / "concierge.token"
@@ -34,8 +34,8 @@ if not (ticket.isdigit() and note.isdigit()):
     sys.exit("kb-agent-concierge: KB_TICKET/KB_NOTE missing")
 
 
-def kb(*args):
-    return subprocess.run(["python3", str(KB), "--session", token, *args], capture_output=True, text=True)
+def kb(*args, stdin=None):
+    return subprocess.run(["python3", str(KB), *args, "--session", token], capture_output=True, text=True, input=stdin)
 
 
 token = TOKEN.read_text().strip() if TOKEN.exists() else ""
@@ -47,9 +47,17 @@ if not token or kb("whoami").returncode != 0:
 
 
 def newest_own_note(kind: str = "%") -> int:
-    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
-    return conn.execute("SELECT coalesce(max(id), 0) FROM notes WHERE ticket_id=? AND author_name='concierge'"
-                        " AND kind LIKE ?", (int(ticket), kind)).fetchone()[0]
+    with sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10) as conn:
+        return conn.execute("SELECT coalesce(max(n.id), 0) FROM note n"
+                            " JOIN session s ON s.token=n.author"
+                            " WHERE n.ticket_id=? AND s.name='concierge' AND n.kind LIKE ?",
+                            (int(ticket), kind)).fetchone()[0]
+
+
+def ticket_state():
+    with sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10) as conn:
+        return conn.execute("SELECT type, addressee, status FROM ticket WHERE id=?",
+                            (int(ticket),)).fetchone()
 
 
 def journal_mentions() -> int:
@@ -75,9 +83,9 @@ def save():
 
 def escalate(reason: str) -> None:
     """Tell Sebastian through a curator request; the note counts as done only if that request exists."""
-    out = kb("add", "--new", "--type", "request", "--to", "curator", "--repo", ".agents", "--note",
-             f"concierge hat kb #{ticket} Notiz {note} nicht bearbeitet: {reason}. Bitte selbst ansehen.",
-             f"concierge: kb #{ticket} braucht dich")
+    out = kb("add", "--new", "--type", "request", "--to", "curator", "--repo", ".agents", "--stdin",
+             f"concierge: kb #{ticket} braucht dich",
+             stdin=f"concierge hat kb #{ticket} Notiz {note} nicht bearbeitet: {reason}. Bitte selbst ansehen.")
     save()
     sys.exit(0 if out.returncode == 0 else 1)
 
@@ -126,11 +134,10 @@ with open(log, "w") as fh:
     except subprocess.TimeoutExpired:
         fh.write(f"\nkb-agent-concierge: timeout after {TIMEOUT} s\n")
 
-conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
-kind, to_name, status = conn.execute("SELECT type, to_name, status FROM tickets WHERE id=?", (int(ticket),)).fetchone()
+kind, addressee, status = ticket_state()
 answered = newest_own_note() > before_note
-if kind == "request" and to_name == "concierge" and status != "closed":
-    done = newest_own_note("reply") > before_reply  # an open request needs a real --reply
+if kind == "request" and addressee == "concierge" and status not in ("done", "abandoned"):
+    done = newest_own_note("reply") > before_reply  # an open request needs a real --kind reply
 else:
     done = answered or journal_mentions() > before_journal
 sys.exit(0 if done else 1)

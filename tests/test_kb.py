@@ -510,12 +510,8 @@ class ApprovalTest(KbCase):
         self.assertRegex(line, r'  \d+m  ')  # waiting age for a todo request
         self.assertIsNone(self.board_line(other, '--label', 'approval'))
         self.assertEqual(self.code('close', req, '--session', agent, stdin='done\n'), 1)
-        # The opener cannot record the approval itself; the curator claims and replies.
-        self.assertEqual(self.code('note', '--kind', 'reply', req, '--session', agent,
-                                   stdin='approved\n'), 1)
-        cur = self.start('curator')
-        self.ok('claim', req, '--session', cur)
-        self.ok('note', '--kind', 'reply', req, '--session', cur, stdin='approved\n')
+        # The opener records the curator's answer from its conversation.
+        self.ok('note', '--kind', 'reply', req, '--session', agent, stdin='curator: approved\n')
         self.assertIn('answered', self.board_line(req, '--to', 'curator'))
         self.ok('close', req, '--session', agent, stdin='committed\n')
         self.assertEqual(self.ticket(req)[0], "done")

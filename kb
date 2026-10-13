@@ -1286,14 +1286,17 @@ def cmd_note(args):
     words = ' '.join(args.text).strip()
     text = read_text(True) if words in ('', '-') else words
     with transaction(conn):
-        row = conn.execute('SELECT type, assignee FROM ticket WHERE id=?', (args.id,)).fetchone()
+        row = conn.execute('SELECT type, assignee, opener, addressee FROM ticket WHERE id=?',
+                           (args.id,)).fetchone()
         require(conn, row is not None, args.id, 'note')
         if kind == 'reply':
-            # The session answering a request holds it, so the board shows who answers.
+            # The session answering a request holds it, so the board shows who answers. The
+            # opener of a request to the curator records the curator's answer given in its
+            # conversation (an approval); kb cannot check who gave it.
             if row[0] != 'request':
                 raise Rejected('note --reply rejected: ticket %d is a task; replies answer'
                                ' requests' % args.id)
-            if row[1] != me:
+            if row[1] != me and not (row[3] == CURATOR and row[2] == me):
                 raise Rejected('note --reply rejected: claim request %d before replying'
                                ' (kb claim %d)' % (args.id, args.id))
         conn.execute('UPDATE ticket SET updated=? WHERE id=?', (now(), args.id))

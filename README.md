@@ -9,6 +9,11 @@ decides.
 `kb` is one Python file over one SQLite database. There is no server process. One machine, the
 host, holds the board. Other machines, the guests, use it over ssh (see "Host and guests").
 
+Version 0.3 combines two implementations: the pidso `kb` 0.2 (lifecycle, guest mode, hints,
+guard, report, setup) as the base, and the beelink `kb.py` 1.x (push notifications, backlog,
+labels, takeover, tty curator, terse flags), whose board it imports in place. See
+[ADR 0004](docs/adr/0004-combine-beelink-and-pidso-kb.md).
+
 ## Requirements
 
 - Python 3.9 or later, with its bundled `sqlite3` (SQLite 3.26 or later)
@@ -22,7 +27,7 @@ host, holds the board. Other machines, the guests, use it over ssh (see "Host an
 Clone the repository and run the setup, as host or as guest:
 
 ```sh
-git clone git@bitbucket.org:pidso/agent-kanban.git ~/agent-kanban
+git clone https://github.com/sebastianlang84/agent-kanban.git ~/agent-kanban
 ~/agent-kanban/install.sh --host                  # this machine holds the board
 ~/agent-kanban/install.sh --guest <ssh-dest>      # this machine uses the board on <ssh-dest>
 ```
@@ -64,7 +69,17 @@ Setup skips a harness whose directory does not exist. These steps stay manual:
 - Add who the curator is to the instruction files, if agents should name them.
 
 The board is created on the host at the first call, at `~/.local/share/agent-kanban/board.sqlite`.
-Set `KB_DB` to use another path; it must lie outside every git working tree.
+Set `KB_DB` (environment or config file) to use another path; it must lie outside every git
+working tree, or in a path that git ignores there.
+
+### Upgrade from the beelink kb.py 1.x
+
+The first `kb` call on an old board (tables `sessions`, `tickets`, `notes`) migrates it in place,
+in one transaction: ticket and note ids, note text and session tokens stay, so saved tokens and
+`#<id>` references keep working. Statuses map open → todo, claimed → doing, closed → done (a
+closed request without a reply → abandoned); note kinds note → comment, result → close, event →
+event. Old prompt marks are dropped; imported requests and replies are never hinted again. Back up
+first (`kb.py backup`) and keep the old `kb.py` for a rollback onto that copy.
 
 Hooks record session start, activity and end, and show a session new requests and replies at its
 next prompt, and remind it to close answered requests and the tickets it holds, or to continue,
@@ -86,16 +101,34 @@ Agents follow the skill. The commands a person needs most:
 
 ```sh
 kb board                  # open and running tickets, with flags such as idle>24h
-kb board --to curator     # approvals and questions waiting for the curator
+kb board --to curator     # approvals and questions waiting for the curator (and for any)
+kb board --label sudo     # e.g. the steps that need sudo
+kb board --closed 2       # closed in the last two days; --all adds done, abandoned, backlog
 kb show <id>              # one ticket with its notes
 kb sessions               # session names seen in 14 days or holding a ticket; kb whoami: yours
-kb --version              # release, plus the commit in a git checkout: kb 0.2.0 (f2ef896)
+kb label <id> backlog     # park a task (hidden from kb board); --remove backlog brings it back
+kb --version              # release, plus the commit in a git checkout: kb 0.3.0 (f2ef896)
 ```
+
+`kb board --json` prints one JSON list for scripts. A ticket is never released automatically:
+a held ticket whose session ended (and did not resume) or went idle shows `session-ended` or
+`idle>24h`, and another session takes it over only explicitly with `kb claim --take <id>`.
+
+### Push notifications
+
+After every command that added notes, `kb` starts each executable in `<db dir>/notify.d/` once,
+detached, with `KB_DB`, `KB_FIRST_NOTE` and `KB_LAST_NOTE` set; `<db dir>/notify.last` records
+the newest note they were started for, so a crashed writer is caught up by the next command.
+`tools/kb-watch --for <name> [--exec CMD]` follows the notes for one session name with inotify
+(no polling), for a session that waits for an answer. `tools/` also holds the restricted
+wrappers `kb-concierge` and `kb-remote` and the headless `kb-agent-concierge`.
 
 `kb --version` adds `-dirty` to the commit when `kb` differs from it, and prints the bare release
 for a copy outside a git checkout or without git. On a guest it reports the guest's own `kb`.
 
-To act as the curator, start a session on the host from a plain terminal, not from an agent:
+To act as the curator, run `kb` on the host from a plain terminal, not from an agent: a call with
+no token and no harness above it, from a terminal with a controlling tty, acts as `curator`. An
+explicit curator token works too:
 
 ```sh
 kb start --as curator     # prints a token; pass it as --session <token>
@@ -172,6 +205,8 @@ older `kb` refuses a newer one.
 ## Documentation
 
 - [`docs/workflow.md`](docs/workflow.md): steps, identity, hooks, approvals, flags, `kb report`
+- [`legacy/`](legacy/): the beelink `kb.py` 1.x, its tests and README, kept for the import and a
+  rollback
 - [`skills/using-kb/SKILL.md`](skills/using-kb/SKILL.md): what agents do
 - [`PLAN.md`](PLAN.md) and [`docs/adr/`](docs/adr/): design and decisions
 

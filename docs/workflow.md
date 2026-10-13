@@ -8,24 +8,33 @@ skill [`skills/using-kb/SKILL.md`](../skills/using-kb/SKILL.md).
 
 | # | Who | What | Command |
 |---|---|---|---|
-| 1 | start hook | registers the session silently: harness, harness session id, folder, repository name | `kb hook start --harness <h>` |
+| 1 | start hook | registers the session (harness, harness session id, folder, repository name) and tells it its name and the tickets of its repository it may take over | `kb hook start --harness <h>` |
 | 2 | agent | reads open and running tickets of the repository | `kb board --repo <repo>` |
-| 3 | agent | claims a matching ticket, or adds a new task that is claimed at once | `kb claim <id>` · `kb add "<goal>"` |
+| 3 | agent | claims a matching ticket, or adds a new task that is claimed at once (a token session adds it as todo unless `--claim`) | `kb claim <id>` · `kb add "<goal>"` |
 | 4 | stop hook | after every answer, sets `last_activity` of the session's open tickets | `kb hook stop --harness <h>` |
-| 5 | agent | closes the ticket with the three closing lines on stdin | `kb close <id> < lines` |
+| 5 | agent | closes the ticket with the three closing lines | `kb close <id> --where … --changed … --open …` (or the lines on stdin) |
 | 6 | end hook | writes a `session-ended` note on tickets the session left open | `kb hook end --harness <h>` |
 | 7 | curator | reads the board and its flags | `kb board` · `kb show <id>` |
 
 Step 1 is not required for correctness: a session without a row registers itself on its first `kb`
-call. Steps 4 and 6 only record. No hook blocks; only the prompt hook and the guard hook add
+call. Steps 4 and 6 only record. No hook blocks; only the start, prompt and guard hooks add
 context (see Hooks).
+
+Nothing releases a ticket automatically. A held ticket whose session ended shows
+`session-ended` until a start or stop of that session follows (Claude `--resume` keeps the
+session id); one without activity for `KB_STALE_HOURS` shows `idle>24h`. With either flag
+another session may take it over: `kb claim --take <id>` (an `event` note records it). Without a
+flag, ask the holder with a request, or the curator to release it.
 
 ## Identity
 
 A harness session passes no token. `kb` takes the session from the harness's own environment
-variable (`CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`, `PI_SESSION_ID`). The session name is the
-repository name; in a linked worktree it is the main checkout's name. `kb start --as <name>` renames
-the session. If several of these variables are set, pass `--harness <claude|codex|pi>`.
+variable (`CLAUDE_CODE_SESSION_ID`; `CODEX_SESSION_ID` or `CODEX_THREAD_ID`; `PI_SESSION_ID` or
+`KB_SESSION=pi:<id>`, which the pi adapter exports). The session name is the repository name; in
+a linked worktree it is the main checkout's name. `kb name <name>` renames the calling session.
+Nested harnesses (a codex call from a Claude session) inherit each other's variables: if several
+are set, the nearest harness process above `kb` decides (Linux `/proc`), else pass `--harness
+<claude|codex|pi>`. `KB_HARNESS=<h>|none` overrides the detection.
 
 Each installation, host or guest, has an installation id (`KB_INSTALLATION` in the config, written
 by `kb setup`). The host keys a harness session by installation, harness and harness session id,
@@ -40,12 +49,16 @@ registering it; `kb sessions` lists the session names seen in the last 14 days o
 doing or blocked ticket (`--all`: every name). `kb add --type request --to <name>` warns on
 stderr when no session currently has that name.
 
-A script without a harness id runs `kb start --as <name>` once and passes the printed token as
-`--session <token>` (or `KB_SESSION`) on every call, on the host and on a guest alike.
+A script, or another machine over plain ssh, runs `kb start --as <name>` once and passes the
+printed token as `--session <token>` (before or after the command, or as `KB_SESSION`) on every
+call. `kb start` always starts a new token session, also inside a harness. `kb end` ends it: its
+held tickets get a `session-ended` note and stay held.
 
-The curator works on the host, from a plain terminal without a harness id (`kb start --as
-curator`). A harness session cannot take the name `curator`, and a harness session holding the
-curator's token does not get curator rights. A guest can neither start nor use a curator session.
+The curator works on the host, from a plain terminal: a call without token and without harness,
+from a terminal with a controlling tty, acts as the session `curator`; `kb start --as curator`
+gives an explicit token. A harness session cannot take the name `curator`, and a harness session
+holding the curator's token does not get curator rights. A guest can neither start nor use a
+curator session. This guards against mistakes; it is not authentication.
 
 ## Hooks
 
@@ -81,7 +94,13 @@ heredoc that expands them, other heredoc bodies are skipped. So `cd x && git com
 count while `echo "git push"`, `git commit-tree`, `git merge-base` and `docker compose logs up`
 do not. Not seen: commands inside `bash -c`, `eval` or an alias. pi has no guard hook.
 
-Hooks always exit 0; only the prompt hook and the guard hook print. At each user prompt the
+Hooks always exit 0; only the start, prompt and guard hooks print. The start hook names the
+session (`kb: this session is <name> ...`) and lists held tickets of its repository whose holder
+ended or went idle, with `kb claim --take <id>`. Start and prompt output is
+`hookSpecificOutput.additionalContext` JSON for Claude Code and codex, plain text for pi or with
+`--format text`. `KB=0` or `BRAIN_SESSION_CONTEXT=0` turns all hooks off for automated runs.
+Touching `hook-debug.log` beside the database logs each hook call (event and payload keys, never
+prompt text). At each user prompt the
 prompt hook lists, once per session
 name, requests addressed to that name or to `any` that nobody has claimed and that the session
 did not open itself, and replies by another session to requests that a session of this name
@@ -93,8 +112,8 @@ older than `KB_STALE_HOURS` (the board's `idle>` flag) gets, instead, a reminder
 `last_activity`); ownership never changes. At most five of each kind are listed; the
 rest follow at the next prompt, except idle reminders: the rest are listed by `kb board --mine`
 and come back only while those tickets stay idle. Titles are cut to one line of 80 characters. Only requests and
-replies after the schema v4 migration are hinted, and only for a session the start hook has
-registered. Claude Code and codex add the printed text as context; the pi
+replies after the schema v4 migration (or after the import of a beelink board) are hinted, and
+only for a session the start hook has registered. Claude Code and codex add the printed text as context; the pi
 extension returns it as a message. Errors go to `hook-errors.log` in the directory of `KB_DB`
 (default `~/.local/share/agent-kanban/`). The end hook must finish within the harness limit
 (Claude Code 1.5 s shared default, codex at most 3 s); it waits at most 1 s for a database lock.
@@ -125,8 +144,10 @@ An agent that waits for the curator's approval (commit, merge, push, destructive
 files it as a request to `curator`, with the exact command as the note:
 
 ```
-kb add --type request --to curator --label approval "Commit PLAN.md D9 in agent-kanban" --stdin < cmd
+kb add --type request --to curator --label approval "Commit PLAN.md D9 in agent-kanban" --note "<exact command>"
 ```
+
+A step that needs sudo also gets the label `sudo`, so `kb board --label sudo` collects them.
 
 The curator sees every pending approval with its age and requesting session:
 
@@ -134,16 +155,22 @@ The curator sees every pending approval with its age and requesting session:
 kb board --to curator            # or: kb board --label approval
 ```
 
-After the curator's answer, the agent records it and closes the request:
+The curator answers from a plain terminal on the host: it claims the request and replies (only
+the session holding a request replies, so an agent cannot record an approval itself), then the
+agent closes it:
 
 ```
-kb note --kind reply <id> < answer
-kb close <id> < closing-lines
+kb claim <id>                    # curator
+kb note <id> --reply "approved"  # curator
+kb close <id> --result "done"    # agent (opener); the assignee may close too
 ```
 
-A request with a recorded reply shows `answered` until the agent closes it; a request cannot be
-closed without a reply. Its opener or its assignee closes it. A rejected command names the condition
-that failed, for example the missing reply note or the session that may act. One that waits longer than `KB_STALE_HOURS` shows `waiting>24h`.
+A request with a recorded reply shows `answered` until it is closed; the prompt hook reminds the
+opener to close it. A request cannot be closed without a reply; its opener, its assignee, the
+curator or a later session with the opener's name closes it. `kb close <id> --withdraw` drops an
+unanswered request (abandoned). A rejected command names the condition that failed, for example
+the missing reply note or the session that may act. One that waits longer than `KB_STALE_HOURS`
+shows `waiting>24h`.
 
 ## Board flags
 
@@ -153,12 +180,15 @@ that failed, for example the missing reply note or the session that may act. One
 | `waiting>24h` | a todo ticket nobody has claimed for `KB_STALE_HOURS` |
 | `from:<session>` | the session that opened a request |
 | `answered` | a request has a reply but is not closed yet |
-| `session-ended` | the owning session ended without `kb close` |
+| `session-ended` | the owning session ended without `kb close` and did not resume; `kb claim --take` may take it |
 | `worktree-gone` | the ticket's worktree no longer exists (tickets of a host session only) |
 | `merged` | the ticket's branch is merged into its merge target |
 | `git:unknown` | git state not checkable (a guest session's ticket, or no worktree) |
 
-Flags are hints. Only the owner or the curator releases a ticket (`kb release <id>`).
+| `#<label>` | a label; `#backlog` tickets are hidden unless `--all`, `--label backlog` or `--to` |
+
+Flags are hints. Only the owner or the curator releases a ticket (`kb release <id> --why "<handoff>"`);
+another session takes over a `session-ended` or `idle>` ticket with `kb claim --take <id>`.
 
 ## Compliance report
 

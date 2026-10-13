@@ -866,7 +866,10 @@ def reason(conn, ticket_id, action, me=None, name=None):
     statuses, actor = RULES[action]
     verb = action.split()[0]
     if status not in statuses:
-        return '%s; %s needs %s' % (describe(conn, ticket_id), verb, ' or '.join(statuses))
+        gone = holder_gone(conn, ticket_id) if action == 'claim' else ''
+        return '%s; %s needs %s%s' % (describe(conn, ticket_id), verb, ' or '.join(statuses),
+                                      '; its holder is %s, so kb claim --take %s takes it over'
+                                      % (gone, ticket_id) if gone else '')
     if action == 'claim':  # mirrors CLAIM_SQL
         if assignee is not None:
             gone = holder_gone(conn, ticket_id)
@@ -1081,9 +1084,14 @@ def holder_gone(conn, ticket_id):
         return ''
     activity, _, harness, hsid, inst, ended = row
     why = []
+    # as on the board: a start or stop after the end; in the end's own second, stored after it
     if ended and not (hsid and conn.execute(
-            "SELECT 1 FROM session_event WHERE installation=? AND harness=? AND harness_session=?"
-            " AND event IN ('start', 'stop') AND time>?", (inst, harness, hsid, ended)).fetchone()):
+            "SELECT 1 FROM session_event e WHERE e.installation=? AND e.harness=?"
+            " AND e.harness_session=? AND e.event IN ('start', 'stop') AND (e.time>? OR e.time=?"
+            " AND EXISTS (SELECT 1 FROM session_event x WHERE x.event='end'"
+            " AND x.installation=e.installation AND x.harness=e.harness"
+            " AND x.harness_session=e.harness_session AND x.time=? AND x.id<e.id))",
+            (inst, harness, hsid, ended, ended, ended)).fetchone()):
         why.append('session-ended')
     if parse_time(activity) < cutoff:
         why.append('idle>%gh' % hours)
@@ -3195,6 +3203,7 @@ def append_authorized(path, entry, blob, inst):
 
 BOARD_LINE = ('- Run `kb board --repo <repo>` before starting a task and load the `using-kb`'
               ' skill.')
+BOARD_LINE_OWN = '- Shared board `kb`'
 PI_KB_PLACEHOLDER = '@KB_COMMAND@'
 PI_MARK = '// installed by kb setup'  # first line of hooks/pi/kb.ts; only such a file is replaced
 # Harness event names per kb hook event; timeouts in seconds, as the README lists them.
@@ -3233,7 +3242,7 @@ def kb_hook_program(entry, event, harness, windows):
     def base(word):
         return re.split(r'[\\/]', word)[-1].lower()
     n = 2 if words and PYTHON_RE.fullmatch(base(words[0])) else 1
-    if len(words) < n + 2 or base(words[n - 1]) not in ('kb', 'kb.cmd') \
+    if len(words) < n + 2 or base(words[n - 1]) not in ('kb', 'kb.cmd', 'kb.py') \
             or words[n:n + 2] != ['hook', event]:
         return None
     rest = words[n + 2:]
@@ -3540,7 +3549,9 @@ class Setup:
             text = old or ''
             imported = self.imported(path, text, {r for _, r in files if r != real}) \
                 if path == claude else None  # only Claude Code follows @ imports
-            has = any(line.strip() == BOARD_LINE for line in text.splitlines())
+            # the beelink wording of the rule (one bullet starting 'Shared board `kb`') counts too
+            has = any(line.strip() == BOARD_LINE or line.startswith(BOARD_LINE_OWN)
+                      for line in text.splitlines())
             if has and imported:  # Claude reads it twice; the user's file stays as it is
                 print('note: %s has the Board line and also imports %s, which has it; remove'
                       ' it from %s' % (path, imported, path))

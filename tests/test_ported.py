@@ -100,6 +100,25 @@ class PortedTest(KbCase):
         self.assertIn('conflicting codex session ids', r.stderr)
         same = dict(self.env, CODEX_SESSION_ID='one', CODEX_THREAD_ID='one')
         self.assertEqual(self.code('add', 'y', '--repo', 'r', env=same), 0)
+        # an unambiguous other harness, selected explicitly, still works
+        mixed = dict(env, CLAUDE_CODE_SESSION_ID='cc-x')
+        self.assertEqual(self.code('add', 'z', '--repo', 'r', '--harness', 'claude', env=mixed), 0)
+
+    def test_notify_on_first_use_dispatches_the_first_note(self):
+        folder = os.path.join(self.tmp, 'notify.d')
+        os.mkdir(folder)
+        out = os.path.join(self.tmp, 'first')
+        script = os.path.join(folder, '10-record')
+        with open(script, 'w') as f:
+            f.write('#!/bin/sh\necho "$KB_FIRST_NOTE-$KB_LAST_NOTE" >> %s\n' % out)
+        os.chmod(script, os.stat(script).st_mode | stat.S_IXUSR)
+        self.ok('add', 'q', '--type', 'request', '--to', 'bob', '--session', self.alice)
+        import time
+        deadline = time.time() + 10
+        while time.time() < deadline and not os.path.exists(out):
+            time.sleep(0.05)
+        with open(out) as f:
+            self.assertEqual(f.read().split(), ['1-1'])
 
     def test_curator_close_of_a_held_request_needs_force(self):
         cur = self.start('curator')

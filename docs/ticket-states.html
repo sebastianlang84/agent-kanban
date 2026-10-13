@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ticket states · agent-kanban</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:  #fafafa;
+      --color-ink:    #000000;
+      --color-muted:  #717273;
+      --color-soft:   #8a8b8c;
+      --color-rule:   rgba(0,0,0,0.12);
+      --font-sans:    'Geist', system-ui, sans-serif;
+      --font-serif:   'Instrument Serif', serif;
+      --font-mono:    'Geist Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { max-width: 1200px; width: 100%; }
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      margin-bottom: 1.5rem;
+    }
+    .diagram-container { overflow-x: auto; }
+    svg { width: 100%; min-width: 960px; display: block; }
+    .note {
+      margin-top: 1.25rem;
+      padding-top: 0.75rem;
+      border-top: 1px solid var(--color-rule);
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--color-muted);
+      line-height: 1.6;
+    }
+    @media print { .diagram-container { overflow: visible; } }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">State machine · agent-kanban</p>
+    <h1>Lifecycle of a kb ticket</h1>
+
+    <div class="diagram-container">
+    <svg viewBox="0 0 960 544" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ticket-states-title ticket-states-desc">
+      <title id="ticket-states-title">Lifecycle of a kb ticket</title>
+      <desc id="ticket-states-desc">State machine of a kb ticket: kb add creates a request in todo and a task directly in doing; claim, block, resume, release, close, abandon and reopen move it between todo, doing, blocked, done and abandoned.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#717273"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#d90000"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#fafafa"/>
+
+      <!-- Zone: OWNED = ('doing', 'blocked') -->
+      <rect x="416" y="128" width="224" height="264" rx="6" fill="rgba(0,0,0,0.02)" stroke="#c4c5c6" stroke-width="1"/>
+      <text x="428" y="148" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">OWNED</text>
+      <text x="428" y="382" fill="#717273" font-size="8" font-family="'Geist Mono', monospace">held by the assignee</text>
+
+      <!-- Transitions (drawn before states) -->
+      <!-- add, request: start -> todo -->
+      <line x1="66" y1="188" x2="184" y2="188" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- add, task: start -> doing (created claimed) -->
+      <path d="M60,182 V104 a8,8 0 0 1 8,-8 H520 a8,8 0 0 1 8,8 V164" fill="none" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- claim: todo -> doing -->
+      <line x1="328" y1="188" x2="456" y2="188" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- release: owned -> todo -->
+      <line x1="416" y1="212" x2="328" y2="212" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- block: doing -> blocked -->
+      <line x1="504" y1="236" x2="504" y2="292" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- resume: blocked -> doing -->
+      <line x1="552" y1="292" x2="552" y2="236" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- close: owned -> done (focal) -->
+      <line x1="640" y1="200" x2="760" y2="200" stroke="#d90000" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <!-- abandon: todo -> abandoned -->
+      <line x1="232" y1="236" x2="232" y2="320" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- reopen: abandoned -> todo -->
+      <line x1="280" y1="320" x2="280" y2="236" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- reopen: done -> todo, hops over the add-task line -->
+      <path d="M832,164 V120 a8,8 0 0 0 -8,-8 H536 a8,8 0 0 0 -16,0 H264 a8,8 0 0 0 -8,8 V164" fill="none" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- close, request with reply: todo -> done -->
+      <path d="M184,212 H136 a8,8 0 0 0 -8,8 V440 a8,8 0 0 0 8,8 H824 a8,8 0 0 0 8,-8 V236" fill="none" stroke="#717273" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+
+      <!-- Transition labels (8px gap to the stroke) -->
+      <rect x="92" y="168" width="68" height="12" rx="2" fill="#fafafa"/>
+      <text x="126" y="177" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ADD REQUEST</text>
+
+      <rect x="256" y="64" width="88" height="12" rx="2" fill="#fafafa"/>
+      <text x="300" y="73" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ADD TASK</text>
+      <rect x="256" y="76" width="88" height="12" rx="2" fill="#fafafa"/>
+      <text x="300" y="85" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">created claimed</text>
+
+      <rect x="336" y="156" width="72" height="12" rx="2" fill="#fafafa"/>
+      <text x="372" y="165" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CLAIM</text>
+      <rect x="336" y="168" width="72" height="12" rx="2" fill="#fafafa"/>
+      <text x="372" y="177" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">addressee/any</text>
+
+      <rect x="332" y="220" width="80" height="12" rx="2" fill="#fafafa"/>
+      <text x="372" y="229" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">RELEASE</text>
+      <rect x="332" y="232" width="80" height="12" rx="2" fill="#fafafa"/>
+      <text x="372" y="241" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">assignee/curator</text>
+
+      <rect x="460" y="258" width="36" height="12" rx="2" fill="#fafafa"/>
+      <text x="478" y="267" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">BLOCK</text>
+
+      <rect x="560" y="258" width="44" height="12" rx="2" fill="#fafafa"/>
+      <text x="582" y="267" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">RESUME</text>
+
+      <rect x="672" y="168" width="56" height="12" rx="2" fill="#fafafa"/>
+      <text x="700" y="177" fill="#d90000" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CLOSE</text>
+      <rect x="672" y="180" width="56" height="12" rx="2" fill="#fafafa"/>
+      <text x="700" y="189" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">assignee</text>
+
+      <rect x="148" y="266" width="76" height="12" rx="2" fill="#fafafa"/>
+      <text x="186" y="275" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ABANDON</text>
+      <rect x="148" y="278" width="76" height="12" rx="2" fill="#fafafa"/>
+      <text x="186" y="287" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">opener/curator</text>
+
+      <rect x="288" y="266" width="76" height="12" rx="2" fill="#fafafa"/>
+      <text x="326" y="275" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">REOPEN</text>
+      <rect x="288" y="278" width="76" height="12" rx="2" fill="#fafafa"/>
+      <text x="326" y="287" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">opener/curator</text>
+
+      <rect x="688" y="80" width="80" height="12" rx="2" fill="#fafafa"/>
+      <text x="728" y="89" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">REOPEN</text>
+      <rect x="688" y="92" width="80" height="12" rx="2" fill="#fafafa"/>
+      <text x="728" y="101" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">opener/curator</text>
+
+      <rect x="432" y="416" width="96" height="12" rx="2" fill="#fafafa"/>
+      <text x="480" y="425" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CLOSE REQUEST</text>
+      <rect x="432" y="428" width="96" height="12" rx="2" fill="#fafafa"/>
+      <text x="480" y="437" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">after a reply</text>
+
+      <!-- Start dot -->
+      <circle cx="60" cy="188" r="6" fill="#000000"/>
+
+      <!-- State: todo -->
+      <rect x="184" y="164" width="144" height="72" rx="8" fill="#ffffff" stroke="#000000" stroke-width="1"/>
+      <text x="256" y="196" fill="#000000" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">todo</text>
+      <text x="256" y="212" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">open, no assignee</text>
+
+      <!-- State: doing -->
+      <rect x="456" y="164" width="144" height="72" rx="8" fill="#ffffff" stroke="#000000" stroke-width="1"/>
+      <text x="528" y="196" fill="#000000" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">doing</text>
+      <text x="528" y="212" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">claimed, in work</text>
+
+      <!-- State: blocked -->
+      <rect x="456" y="292" width="144" height="72" rx="8" fill="#ffffff" stroke="#000000" stroke-width="1"/>
+      <text x="528" y="324" fill="#000000" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">blocked</text>
+      <text x="528" y="340" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">claimed, waiting</text>
+
+      <!-- State: done (focal) -->
+      <rect x="760" y="164" width="144" height="72" rx="8" fill="rgba(217,0,0,0.07)" stroke="#d90000" stroke-width="1"/>
+      <text x="832" y="196" fill="#000000" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">done</text>
+      <text x="832" y="212" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">closing note</text>
+
+      <!-- State: abandoned -->
+      <rect x="184" y="320" width="144" height="72" rx="8" fill="rgba(113,114,115,0.10)" stroke="#8a8b8c" stroke-width="1"/>
+      <text x="256" y="352" fill="#000000" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">abandoned</text>
+      <text x="256" y="368" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">dropped unclaimed</text>
+
+      <!-- Legend -->
+      <line x1="40" y1="480" x2="920" y2="480" stroke="rgba(0,0,0,0.10)" stroke-width="0.8"/>
+      <text x="40" y="500" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+      <circle cx="46" cy="518" r="5" fill="#000000"/>
+      <text x="60" y="521" fill="#717273" font-size="8" font-family="'Geist', sans-serif">kb add</text>
+      <rect x="112" y="512" width="16" height="12" rx="2" fill="#ffffff" stroke="#000000" stroke-width="1"/>
+      <text x="136" y="521" fill="#717273" font-size="8" font-family="'Geist', sans-serif">Open state</text>
+      <rect x="200" y="512" width="16" height="12" rx="2" fill="rgba(217,0,0,0.07)" stroke="#d90000" stroke-width="1"/>
+      <text x="224" y="521" fill="#717273" font-size="8" font-family="'Geist', sans-serif">Closed, the goal</text>
+      <rect x="312" y="512" width="16" height="12" rx="2" fill="rgba(113,114,115,0.10)" stroke="#8a8b8c" stroke-width="1"/>
+      <text x="336" y="521" fill="#717273" font-size="8" font-family="'Geist', sans-serif">Closed, dropped</text>
+      <rect x="424" y="512" width="16" height="12" rx="2" fill="rgba(0,0,0,0.02)" stroke="#c4c5c6" stroke-width="1"/>
+      <text x="448" y="521" fill="#717273" font-size="8" font-family="'Geist', sans-serif">Arrow from the frame: from doing or blocked</text>
+      <line x1="640" y1="518" x2="668" y2="518" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <text x="676" y="521" fill="#717273" font-size="8" font-family="'Geist', sans-serif">kb command · who may run it</text>
+      <line x1="800" y1="518" x2="828" y2="518" stroke="#717273" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+      <text x="836" y="521" fill="#717273" font-size="8" font-family="'Geist', sans-serif">Request only</text>
+    </svg>
+    </div>
+
+    <p class="note">kb add creates a task already claimed by the calling session (doing) and a request unclaimed (todo, addressed with --to). A request closes only after a reply note, by its opener or its assignee, from todo, doing or blocked. The curator closes another session's owned ticket with kb close --force. Details: docs/workflow.md.</p>
+  </div>
+</body>
+</html>

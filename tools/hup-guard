@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Run a long-lived command and stop it when the ssh client goes away.
+
+    hup-guard [--max SECONDS] CMD [ARGS...]
+
+`ssh host 'cmd'` without a tty gets no SIGHUP when the client disconnects, so followers such as
+`journalctl -f`, `docker logs -f` or `tail -f` keep running forever (reparented to init). This
+wrapper starts CMD in its own process group and polls its own stdout/stderr: when sshd closes the
+pipe, poll() reports POLLERR/POLLHUP and the whole group gets SIGTERM (SIGKILL after 5 s).
+--max adds a hard time limit. The exit code is CMD's (143 if it was stopped by hup-guard).
+"""
+import os
+import select
+import signal
+import stat
+import sys
+import time
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    limit = None
+    if args[:1] == ["--max"]:
+        limit = float(args[1])
+        args = args[2:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    watched = [fd for fd in (1, 2) if stat.S_ISFIFO(os.fstat(fd).st_mode) or stat.S_ISSOCK(os.fstat(fd).st_mode)]
+    pid = os.fork()
+    if pid == 0:
+        os.setpgid(0, 0)
+        try:
+            os.execvp(args[0], args)
+        except OSError as e:
+            print(f"hup-guard: {args[0]}: {e.strerror}", file=sys.stderr)
+            os._exit(127)
+    os.setpgid(pid, pid) if os.getpgid(pid) != pid else None
+
+    def stop(*_):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                return
+            time.sleep(0.1)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, lambda *_: (stop(), sys.exit(143)))
+    poller = select.poll()
+    for fd in watched:
+        poller.register(fd, 0)  # errors and hangups only
+    deadline = None if limit is None else time.monotonic() + limit
+    while True:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            return os.waitstatus_to_exitcode(status) if status >= 0 else 1
+        if deadline is not None and time.monotonic() >= deadline:
+            stop()
+            return 124
+        if any(ev & (select.POLLERR | select.POLLHUP) for _, ev in poller.poll(1000)):
+            stop()
+            return 143
+
+
+if __name__ == "__main__":
+    sys.exit(main())

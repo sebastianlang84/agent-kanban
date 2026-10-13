@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""concierge: headless Claude Code agent on beelink that handles one kb note, then exits.
+
+Called by kb-watch (--exec) from ~/.agents/state/kb/notify.d/20-concierge with KB_TICKET, KB_NOTE,
+KB_AUTHOR, KB_KIND and KB_TITLE. Runs `claude -p` in ~/.agents/concierge (CLAUDE.md there gives
+role, rules and environment; the global ~/.agents/AGENTS.md loads as well) in dontAsk mode with the
+tool allowlist in ~/.agents/concierge/permissions.json.
+
+Exit 0 means the note is done (answered, or deliberately skipped, or escalated to Sebastian);
+exit 1 keeps it for a retry. A run counts as done only if concierge left a trace for this ticket:
+a kb note newer than the trigger or a journal entry for the ticket. Limits: 25 turns, 20 minutes,
+3 attempts per note, 40 runs per day, 6 runs per ticket per day; beyond that it escalates.
+Logs: ~/.agents/state/kb/agent-concierge/ (0700, 30 days).
+"""
+import datetime, json, os, re, sqlite3, subprocess, sys, time
+from pathlib import Path
+
+HOME = Path.home()
+KB = HOME / "dev/agent-kanban/kb.py"
+DB = Path(os.environ.get("KB_DB") or HOME / ".agents/state/kb/kb.sqlite")
+STATE = HOME / ".agents/state/kb"
+TOKEN = STATE / "concierge.token"
+LOGS = STATE / "agent-concierge"
+COUNTS = LOGS / "counts.json"
+WORKDIR = HOME / ".agents/concierge"
+JOURNAL = WORKDIR / "journal.md"
+CLAUDE = HOME / ".local/bin/claude"
+TIMEOUT, MAX_TURNS = 20 * 60, "25"
+MAX_ATTEMPTS, MAX_PER_DAY, MAX_PER_TICKET = 3, 40, 6
+
+env = os.environ
+ticket, note = env.get("KB_TICKET", ""), env.get("KB_NOTE", "")
+if not (ticket.isdigit() and note.isdigit()):
+    sys.exit("kb-agent-concierge: KB_TICKET/KB_NOTE missing")
+
+
+def kb(*args):
+    return subprocess.run(["python3", str(KB), "--session", token, *args], capture_output=True, text=True)
+
+
+token = TOKEN.read_text().strip() if TOKEN.exists() else ""
+if not token or kb("whoami").returncode != 0:
+    out = subprocess.run(["python3", str(KB), "start", "--as", "concierge"], capture_output=True, text=True, check=True)
+    token = out.stdout.strip().splitlines()[-1]
+    TOKEN.write_text(token + "\n")
+    TOKEN.chmod(0o600)
+
+
+def newest_own_note(kind: str = "%") -> int:
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+    return conn.execute("SELECT coalesce(max(id), 0) FROM notes WHERE ticket_id=? AND author_name='concierge'"
+                        " AND kind LIKE ?", (int(ticket), kind)).fetchone()[0]
+
+
+def journal_mentions() -> int:
+    return len(re.findall(rf"kb #{ticket}\b", JOURNAL.read_text())) if JOURNAL.exists() else 0
+
+
+LOGS.mkdir(parents=True, exist_ok=True)
+LOGS.chmod(0o700)
+for old in LOGS.glob("*.log"):
+    if time.time() - old.stat().st_mtime > 30 * 86400:
+        old.unlink()
+
+today = datetime.date.today().isoformat()
+counts = json.loads(COUNTS.read_text()) if COUNTS.exists() else {}
+if counts.get("day") != today:
+    counts = {"day": today, "total": 0, "tickets": {}, "attempts": {}}
+attempts = counts["attempts"].get(note, 0)
+
+
+def save():
+    COUNTS.write_text(json.dumps(counts))
+
+
+def escalate(reason: str) -> None:
+    """Tell Sebastian through a curator request; the note counts as done only if that request exists."""
+    out = kb("add", "--new", "--type", "request", "--to", "curator", "--repo", ".agents", "--note",
+             f"concierge hat kb #{ticket} Notiz {note} nicht bearbeitet: {reason}. Bitte selbst ansehen.",
+             f"concierge: kb #{ticket} braucht dich")
+    save()
+    sys.exit(0 if out.returncode == 0 else 1)
+
+
+if attempts >= MAX_ATTEMPTS:
+    escalate(f"{attempts} Versuche ohne Ergebnis")
+if counts["total"] >= MAX_PER_DAY:
+    escalate(f"Tageslimit von {MAX_PER_DAY} Laeufen erreicht")
+if counts["tickets"].get(ticket, 0) >= MAX_PER_TICKET:
+    escalate(f"{MAX_PER_TICKET} Laeufe heute fuer dieses Ticket, moegliches Hin und Her")
+
+counts["total"] += 1
+counts["tickets"][ticket] = counts["tickets"].get(ticket, 0) + 1
+counts["attempts"][note] = attempts + 1
+save()
+
+# Keep the journal readable: move all but the newest 40 entries into a monthly archive.
+if JOURNAL.exists():
+    text = JOURNAL.read_text()
+    entries = re.split(r"(?m)^(?=## )", text)
+    head, body = entries[0], entries[1:]
+    if len(body) > 60:
+        archive = WORKDIR / "journal-archive" / f"{today[:7]}.md"
+        archive.parent.mkdir(exist_ok=True)
+        with open(archive, "a") as fh:
+            fh.write("".join(body[:-40]))
+        JOURNAL.write_text(head + "".join(body[-40:]))
+
+before_note, before_reply, before_journal = newest_own_note(), newest_own_note("reply"), journal_mentions()
+prompt = (f"kb ticket #{ticket} has a new {env.get('KB_KIND', 'note')} (note id {note}) from "
+          f"`{env.get('KB_AUTHOR', '?')}`. Handle it as described in CLAUDE.md (journal and wissen first, "
+          "then `kb-concierge show " + ticket + "`), and append your journal entry before you exit.")
+log = LOGS / f"{datetime.datetime.now():%Y%m%d-%H%M%S}-{ticket}-{note}.log"
+run_env = {**env, "KB": "0", "PATH": f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"}
+with open(log, "w") as fh:
+    os.chmod(log, 0o600)
+    try:
+        subprocess.run(
+            # Only the concierge allowlist: user settings (with their broad allow rules and hooks) and
+            # MCP servers are not loaded. The global AGENTS.md is read explicitly (see CLAUDE.md).
+            [str(CLAUDE), "-p", prompt, "--permission-mode", "dontAsk", "--max-turns", MAX_TURNS,
+             "--setting-sources", "project", "--strict-mcp-config",
+             "--settings", str(WORKDIR / "permissions.json"), "--output-format", "text"],
+            cwd=WORKDIR, env=run_env, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
+            timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        fh.write(f"\nkb-agent-concierge: timeout after {TIMEOUT} s\n")
+
+conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+kind, to_name, status = conn.execute("SELECT type, to_name, status FROM tickets WHERE id=?", (int(ticket),)).fetchone()
+answered = newest_own_note() > before_note
+if kind == "request" and to_name == "concierge" and status != "closed":
+    done = newest_own_note("reply") > before_reply  # an open request needs a real --reply
+else:
+    done = answered or journal_mentions() > before_journal
+sys.exit(0 if done else 1)

@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""kb-watch: push new kb board activity for one session name.
+
+The script sleeps on inotify events for the kb database files and queries only when a write
+happened, so a new note is delivered within about a second. There is no periodic check unless
+--interval is given; a failed --exec is retried after 30 s.
+
+Relevant for NAME are notes by others on tickets that
+  - are addressed to NAME or to "any",
+  - NAME opened or owns, or
+  - NAME has written a note on.
+
+Each new note prints one line: `kb #<ticket> <author> <kind>: <title>`.
+With --exec CMD the script also runs CMD (a failing CMD is retried on the next poll) with KB_TICKET, KB_NOTE, KB_AUTHOR, KB_KIND and KB_TITLE in the
+environment (for example a script that wakes a Paperclip agent).
+
+The last seen note id is kept per name in ~/.agents/state/kb/watch-<name>.last, so a restart does
+not repeat old notes. The first run starts at the newest note.
+
+Usage: kb-watch --for NAME [--interval 0] [--once | --until-first] [--exec CMD]
+"""
+import argparse, ctypes, json, os, select, sqlite3, stat, struct, subprocess, sys, time
+from pathlib import Path
+
+DB = Path(os.environ.get("KB_DB", Path.home() / ".agents/state/kb/kb.sqlite"))
+
+QUERY = """
+SELECT n.id, n.ticket_id, n.author_name, n.kind, t.title
+FROM notes n JOIN tickets t ON t.id = n.ticket_id
+WHERE n.id > :last AND n.author_name != :name AND n.kind != 'event'
+  AND n.author_name NOT IN (SELECT value FROM json_each(:ignore))
+  AND (t.to_name = :name OR (t.to_name = 'any' AND :any) OR t.to_name IN (SELECT value FROM json_each(:also))
+       OR t.creator_name = :name OR t.owner_name = :name
+       OR EXISTS (SELECT 1 FROM notes m WHERE m.ticket_id = t.id AND m.author_name = :name))
+ORDER BY n.id
+"""
+
+IN_MODIFY, IN_CLOSE_WRITE, IN_MOVED_TO, IN_CREATE = 0x2, 0x8, 0x80, 0x100
+
+
+class Waiter:
+    """Blocks until a kb.sqlite* file in the database directory changes, or the timeout ends."""
+
+    def __init__(self, directory: Path):
+        self.fd = -1
+        # Started over ssh without a tty, stdout is the session pipe. When the client goes away,
+        # sshd closes its end and poll() reports POLLERR/POLLHUP on stdout; exit then instead of
+        # lingering (sshd sends no SIGHUP without a tty). stdin is not used: it may be EOF at once.
+        mode = os.fstat(1).st_mode
+        self.peer = 1 if stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) else None
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            fd = libc.inotify_init1(os.O_CLOEXEC)
+            mask = IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE
+            if fd >= 0 and libc.inotify_add_watch(fd, str(directory).encode(), mask) >= 0:
+                self.fd = fd
+        except (OSError, AttributeError):
+            pass
+
+    def wait(self, timeout: float | None) -> None:
+        if self.fd < 0:
+            time.sleep(timeout or 20)  # no inotify: polling is the only option
+            return
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            left = None if deadline is None else deadline - time.monotonic()
+            poller = select.poll()
+            poller.register(self.fd, select.POLLIN)
+            if self.peer is not None:
+                poller.register(self.peer, 0)  # errors and hangups only
+            events = dict(poller.poll(None if left is None else max(0, int(left * 1000))))
+            if not events:
+                return
+            if events.get(self.peer, 0) & (select.POLLERR | select.POLLHUP):
+                sys.exit(0)  # client disconnected
+            if self.fd not in events:
+                continue
+            buf = os.read(self.fd, 65536)
+            hit, off = False, 0
+            while off < len(buf):
+                _, _, _, length = struct.unpack_from("iIII", buf, off)
+                name = buf[off + 16:off + 16 + length].rstrip(b"\0")
+                hit = hit or name.startswith(DB.name.encode())
+                off += 16 + length
+            if hit:
+                time.sleep(0.2)  # let the writer finish its transaction
+                while select.select([self.fd], [], [], 0)[0]:
+                    os.read(self.fd, 65536)  # drop the rest of this write burst
+                return
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--for", dest="name", required=True)
+    p.add_argument("--interval", type=float, default=0, help="fallback wake-up in seconds; 0 = only on inotify events")
+    p.add_argument("--once", action="store_true")
+    p.add_argument("--until-first", action="store_true", help="exit after delivering the first new note")
+    p.add_argument("--exec", dest="cmd")
+    p.add_argument("--no-any", action="store_true", help="ignore tickets addressed to any")
+    p.add_argument("--also-to", default="", help="comma-separated extra addressees, e.g. wasti")
+    p.add_argument("--ignore-author", default="", help="comma-separated authors whose notes are skipped")
+    a = p.parse_args()
+
+    state = DB.parent / f"watch-{a.name}.last"
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+    if state.exists():
+        last = int(state.read_text().strip() or 0)
+    else:
+        # No cursor yet: a notify hook passes the first new note, so that note is not skipped.
+        first = os.environ.get("KB_FIRST_NOTE", "")
+        last = (int(first) - 1 if first.isdigit()
+                else conn.execute("SELECT coalesce(max(id), 0) FROM notes").fetchone()[0])
+        state.write_text(f"{last}\n")
+
+    also = json.dumps([n for n in a.also_to.split(",") if n])
+    ignore = json.dumps([n for n in a.ignore_author.split(",") if n])
+    waiter = Waiter(DB.parent)
+    inode = DB.stat().st_ino
+    seen_at = time.time()
+    while True:
+        failed = False
+        if DB.stat().st_ino != inode:
+            # Database replaced (restore): ids may restart lower. Treat notes created before the old
+            # database was last read as seen and deliver everything written since.
+            conn.close()
+            conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+            inode = DB.stat().st_ino
+            last = conn.execute("SELECT coalesce(max(id), 0) FROM notes WHERE created_at <= ?",
+                                (seen_at,)).fetchone()[0]
+            state.write_text(f"{last}\n")
+        seen_at = time.time()
+        rows = conn.execute(QUERY, {"last": last, "name": a.name, "also": also, "ignore": ignore, "any": 0 if a.no_any else 1}).fetchall()
+        for note_id, ticket, author, kind, title in rows:
+            if a.cmd:
+                env = {**os.environ, "KB_TICKET": str(ticket), "KB_NOTE": str(note_id),
+                       "KB_AUTHOR": author,
+                       "KB_KIND": kind, "KB_TITLE": title}
+                if subprocess.run(a.cmd, shell=True, env=env).returncode != 0:
+                    failed = True
+                    break  # keep the cursor; retry this note shortly
+            print(f"kb #{ticket} {author} {kind}: {title}", flush=True)
+            last = note_id
+            state.write_text(f"{last}\n")
+        if a.once:
+            return 1 if failed else 0
+        if a.until_first and rows and not failed:
+            return 0
+        waiter.wait(30 if failed else (a.interval or None))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

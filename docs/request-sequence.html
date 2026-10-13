@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>A request between two agent sessions · agent-kanban</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:  #fafafa;
+      --color-ink:    #000000;
+      --color-muted:  #717273;
+      --color-soft:   #8a8b8c;
+      --color-rule:   rgba(0,0,0,0.12);
+      --font-sans:    'Geist', system-ui, sans-serif;
+      --font-serif:   'Instrument Serif', serif;
+      --font-mono:    'Geist Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { max-width: 1200px; width: 100%; min-width: 0; }
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      margin-bottom: 1.5rem;
+    }
+    .diagram-container { width: 100%; overflow-x: auto; }
+    svg { width: 100%; min-width: 1080px; display: block; }
+    .note {
+      margin-top: 1.25rem;
+      padding-top: 0.75rem;
+      border-top: 1px solid var(--color-rule);
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--color-muted);
+      line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Sequence · agent-kanban</p>
+    <h1>A request between two agent sessions</h1>
+
+    <div class="diagram-container">
+    <svg viewBox="0 0 1080 688" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="request-sequence-title request-sequence-desc">
+<title id="request-sequence-title">A request between two agent sessions</title>
+<desc id="request-sequence-desc">Sequence diagram of a kb request: the asking agent checks the addressee name and files a request, the answering agent sees it through its prompt hook, claims it and records a reply, the asker sees the reply through its prompt hook, and the asker or addressee closes the request.</desc>
+<defs>
+  <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#717273"/></marker>
+  <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#d90000"/></marker>
+  <marker id="arrow-open" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polyline points="0 0, 8 3, 0 6" fill="none" stroke="#717273" stroke-width="1.2"/></marker>
+</defs>
+<rect width="100%" height="100%" fill="#fafafa"/>
+<!-- Lifelines -->
+<line x1="200" y1="128" x2="200" y2="600" stroke="rgba(0,0,0,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+<line x1="540" y1="128" x2="540" y2="600" stroke="rgba(0,0,0,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+<line x1="880" y1="128" x2="880" y2="600" stroke="rgba(0,0,0,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+<!-- Flag band: request answered, not closed -->
+<rect x="536" y="432" width="8" height="128" fill="rgba(0,0,0,0.06)" stroke="#717273" stroke-width="0.8"/>
+<!-- Messages -->
+<line x1="200" y1="176" x2="540" y2="176" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="200" y1="240" x2="540" y2="240" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="540" y1="304" x2="880" y2="304" stroke="#717273" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow-open)"/>
+<line x1="880" y1="368" x2="540" y2="368" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="880" y1="432" x2="544" y2="432" stroke="#d90000" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+<line x1="536" y1="496" x2="200" y2="496" stroke="#717273" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow-open)"/>
+<line x1="200" y1="560" x2="536" y2="560" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+<!-- Labels -->
+<rect x="334" y="158" width="72" height="12" rx="2" fill="#fafafa"/>
+<text x="370" y="167" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CHECK NAME</text>
+<rect x="334" y="182" width="72" height="12" rx="2" fill="#fafafa"/>
+<text x="370" y="191" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">kb sessions</text>
+<rect x="354" y="222" width="32" height="12" rx="2" fill="#fafafa"/>
+<text x="370" y="231" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ASK</text>
+<rect x="282" y="246" width="176" height="12" rx="2" fill="#fafafa"/>
+<text x="370" y="255" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">kb add --type request --to &lt;name&gt;</text>
+<rect x="322" y="258" width="96" height="12" rx="2" fill="#fafafa"/>
+<text x="370" y="267" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">question on stdin</text>
+<rect x="674" y="286" width="72" height="12" rx="2" fill="#fafafa"/>
+<text x="710" y="295" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">NEW REQUEST</text>
+<rect x="626" y="310" width="168" height="12" rx="2" fill="#fafafa"/>
+<text x="710" y="319" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">prompt hook, at the next prompt</text>
+<rect x="690" y="350" width="40" height="12" rx="2" fill="#fafafa"/>
+<text x="710" y="359" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CLAIM</text>
+<rect x="670" y="374" width="80" height="12" rx="2" fill="#fafafa"/>
+<text x="710" y="383" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">kb claim &lt;id&gt;</text>
+<rect x="690" y="414" width="40" height="12" rx="2" fill="#fafafa"/>
+<text x="710" y="423" fill="#d90000" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">REPLY</text>
+<rect x="642" y="438" width="136" height="12" rx="2" fill="#fafafa"/>
+<text x="710" y="447" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">kb note --kind reply &lt;id&gt;</text>
+<rect x="666" y="450" width="88" height="12" rx="2" fill="#fafafa"/>
+<text x="710" y="459" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">answer on stdin</text>
+<rect x="338" y="478" width="64" height="12" rx="2" fill="#fafafa"/>
+<text x="370" y="487" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">NEW REPLY</text>
+<rect x="286" y="502" width="168" height="12" rx="2" fill="#fafafa"/>
+<text x="370" y="511" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">prompt hook, at the next prompt</text>
+<rect x="350" y="542" width="40" height="12" rx="2" fill="#fafafa"/>
+<text x="370" y="551" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CLOSE</text>
+<rect x="286" y="566" width="168" height="12" rx="2" fill="#fafafa"/>
+<text x="370" y="575" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">kb close &lt;id&gt; · 3 closing lines</text>
+<rect x="318" y="578" width="104" height="12" rx="2" fill="#fafafa"/>
+<text x="370" y="587" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">asker or addressee</text>
+<rect x="556" y="490" width="64" height="12" rx="2" fill="#fafafa"/>
+<text x="560" y="499" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.08em">ANSWERED</text>
+<!-- Actors -->
+<rect x="120" y="72" width="160" height="56" rx="6" fill="#fafafa"/>
+<rect x="120" y="72" width="160" height="56" rx="6" fill="#ffffff" stroke="#000000" stroke-width="1"/>
+<text x="200" y="98" fill="#000000" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Asking agent</text>
+<text x="200" y="114" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">harness session</text>
+<rect x="460" y="72" width="160" height="56" rx="6" fill="#fafafa"/>
+<rect x="460" y="72" width="160" height="56" rx="6" fill="rgba(0,0,0,0.05)" stroke="#717273" stroke-width="1"/>
+<text x="540" y="98" fill="#000000" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">kb board</text>
+<text x="540" y="114" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">tickets · notes</text>
+<rect x="800" y="72" width="160" height="56" rx="6" fill="#fafafa"/>
+<rect x="800" y="72" width="160" height="56" rx="6" fill="#ffffff" stroke="#000000" stroke-width="1"/>
+<text x="880" y="98" fill="#000000" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Answering agent</text>
+<text x="880" y="114" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">session named &lt;name&gt;</text>
+<!-- Legend -->
+<line x1="40" y1="624" x2="1040" y2="624" stroke="rgba(0,0,0,0.10)" stroke-width="0.8"/>
+<text x="40" y="644" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+<line x1="40" y1="660" x2="68" y2="660" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+<text x="80" y="664" fill="#717273" font-size="8" font-family="'Geist', sans-serif">kb command</text>
+<line x1="168" y1="660" x2="196" y2="660" stroke="#717273" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow-open)"/>
+<text x="208" y="664" fill="#717273" font-size="8" font-family="'Geist', sans-serif">Shown by the prompt hook</text>
+<line x1="360" y1="660" x2="388" y2="660" stroke="#d90000" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+<text x="400" y="664" fill="#717273" font-size="8" font-family="'Geist', sans-serif">The reply</text>
+<rect x="498" y="652" width="8" height="16" fill="rgba(0,0,0,0.06)" stroke="#717273" stroke-width="0.8"/>
+<text x="528" y="664" fill="#717273" font-size="8" font-family="'Geist', sans-serif">Board flags answered until closed</text>
+<rect x="720" y="654" width="28" height="12" rx="2" fill="rgba(0,0,0,0.05)" stroke="#717273" stroke-width="1"/>
+<text x="760" y="664" fill="#717273" font-size="8" font-family="'Geist', sans-serif">Store</text>
+    </svg>
+    </div>
+
+    <p class="note">The prompt hook lists, at each user prompt, unclaimed requests addressed to the session's name or to any, and replies to requests a session of that name opened; it reminds the opener once per latest reply to kb close an answered request, and a session once per claim to kb close the tickets it holds. kb close is refused while a request has no reply; until the close the board flags it answered. Details: docs/workflow.md.</p>
+  </div>
+</body>
+</html>

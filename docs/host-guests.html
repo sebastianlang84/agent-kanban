@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Host and guests · agent-kanban</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:  #fafafa;
+      --color-ink:    #000000;
+      --color-muted:  #717273;
+      --color-soft:   #8a8b8c;
+      --color-rule:   rgba(0,0,0,0.12);
+      --font-sans:    'Geist', system-ui, sans-serif;
+      --font-serif:   'Instrument Serif', serif;
+      --font-mono:    'Geist Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { max-width: 1200px; width: 100%; min-width: 0; }
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      margin-bottom: 1.5rem;
+    }
+    .diagram-container { width: 100%; overflow-x: auto; }
+    svg { width: 100%; min-width: 960px; display: block; }
+    .note {
+      margin-top: 1.25rem;
+      padding-top: 0.75rem;
+      border-top: 1px solid var(--color-rule);
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--color-muted);
+      line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Deployment · agent-kanban</p>
+    <h1>One board host, many guests</h1>
+
+    <div class="diagram-container">
+    <svg viewBox="0 0 960 600" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="host-guests-title host-guests-desc">
+      <title id="host-guests-title">One board host, many guests</title>
+      <desc id="host-guests-desc">Deployment diagram of agent-kanban: a Linux host holds the board in one SQLite file, which the curator and local agent sessions use through kb; a Linux guest and a Windows guest run agent sessions, hooks and kb with a local spool, and reach the host over ssh with a dedicated key that can only run kb serve.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#717273"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#d90000"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#717273"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#fafafa"/>
+
+      <!-- Zones (drawn first) -->
+      <rect x="40" y="40" width="464" height="464" rx="8" fill="rgba(0,0,0,0.02)" stroke="rgba(0,0,0,0.20)" stroke-width="0.8" stroke-dasharray="4,4"/>
+      <rect x="56" y="44" width="88" height="12" fill="#fafafa"/>
+      <text x="100" y="53" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.18em">HOST · LINUX</text>
+
+      <rect x="584" y="40" width="336" height="212" rx="8" fill="rgba(0,0,0,0.02)" stroke="rgba(0,0,0,0.20)" stroke-width="0.8" stroke-dasharray="4,4"/>
+      <rect x="600" y="44" width="100" height="12" fill="#fafafa"/>
+      <text x="650" y="53" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.18em">GUEST · LINUX</text>
+
+      <rect x="584" y="292" width="336" height="212" rx="8" fill="rgba(0,0,0,0.02)" stroke="rgba(0,0,0,0.20)" stroke-width="0.8" stroke-dasharray="4,4"/>
+      <rect x="600" y="296" width="116" height="12" fill="#fafafa"/>
+      <text x="658" y="305" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.18em">GUEST · WINDOWS</text>
+
+      <!-- Arrows (before labels and nodes) -->
+      <!-- Curator uses kb on the board -->
+      <line x1="172" y1="144" x2="172" y2="214" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- Host agent sessions call kb directly -->
+      <line x1="172" y1="384" x2="172" y2="314" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- kb serve runs the guest request on the board -->
+      <line x1="320" y1="264" x2="274" y2="264" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- Linux guest: ssh to kb serve -->
+      <path d="M608,116 H552 Q544,116 544,124 V240 Q544,248 536,248 H482" fill="none" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <!-- Windows guest: ssh to kb serve -->
+      <path d="M608,368 H552 Q544,368 544,360 V288 Q544,280 536,280 H482" fill="none" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+
+      <!-- Arrow labels (beside vertical segments, 8px gap) -->
+      <rect x="180" y="174" width="24" height="12" rx="2" fill="#fafafa"/>
+      <text x="184" y="183" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.08em">KB</text>
+      <rect x="180" y="342" width="24" height="12" rx="2" fill="#fafafa"/>
+      <text x="184" y="351" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.08em">KB</text>
+      <rect x="456" y="170" width="80" height="12" rx="2" fill="#fafafa"/>
+      <text x="496" y="179" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SSH · OWN KEY</text>
+      <rect x="456" y="318" width="80" height="12" rx="2" fill="#fafafa"/>
+      <text x="496" y="327" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SSH · OWN KEY</text>
+
+      <!-- Host: curator -->
+      <rect x="72" y="80" width="200" height="64" rx="6" fill="#fafafa"/>
+      <rect x="72" y="80" width="200" height="64" rx="6" fill="rgba(113,114,115,0.10)" stroke="#8a8b8c" stroke-width="1"/>
+      <rect x="80" y="86" width="32" height="12" rx="2" fill="none" stroke="rgba(0,0,0,0.30)" stroke-width="0.8"/>
+      <text x="96" y="95" fill="#717273" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">USER</text>
+      <text x="172" y="116" fill="#000000" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Curator</text>
+      <text x="172" y="132" fill="#717273" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">plain terminal · no agent</text>
+
+      <!-- Host: board (focal) -->
+      <rect x="72" y="216" width="200" height="96" rx="6" fill="#fafafa"/>
+      <rect x="72" y="216" width="200" height="96" rx="6" fill="rgba(217,0,0,0.07)" stroke="#d90000" stroke-width="1"/>
+      <rect x="80" y="222" width="40" height="12" rx="2" fill="none" stroke="rgba(217,0,0,0.50)" stroke-width="0.8"/>
+      <text x="100" y="231" fill="#d90000" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SQLITE</text>
+      <text x="172" y="256" fill="#000000" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Board</text>
+      <text x="172" y="274" fill="#717273" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">board.sqlite</text>
+      <text x="172" y="290" fill="#717273" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">sessions · tickets · notes</text>
+
+      <!-- Host: agent sessions -->
+      <rect x="72" y="384" width="200" height="64" rx="6" fill="#fafafa"/>
+      <rect x="72" y="384" width="200" height="64" rx="6" fill="#ffffff" stroke="#000000" stroke-width="1"/>
+      <rect x="80" y="390" width="44" height="12" rx="2" fill="none" stroke="rgba(0,0,0,0.40)" stroke-width="0.8"/>
+      <text x="102" y="399" fill="#000000" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HARNESS</text>
+      <text x="172" y="420" fill="#000000" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Agent sessions + hooks</text>
+      <text x="172" y="436" fill="#717273" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">call kb directly</text>
+
+      <!-- Host: kb serve (ssh boundary) -->
+      <rect x="320" y="216" width="160" height="96" rx="6" fill="#fafafa"/>
+      <rect x="320" y="216" width="160" height="96" rx="6" fill="rgba(217,0,0,0.05)" stroke="rgba(217,0,0,0.50)" stroke-width="1" stroke-dasharray="4,4"/>
+      <rect x="328" y="222" width="28" height="12" rx="2" fill="none" stroke="rgba(217,0,0,0.40)" stroke-width="0.8"/>
+      <text x="342" y="231" fill="#717273" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SSH</text>
+      <text x="400" y="256" fill="#000000" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">kb serve</text>
+      <text x="400" y="274" fill="#717273" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">forced command in</text>
+      <text x="400" y="290" fill="#717273" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">authorized_keys</text>
+
+      <!-- Guest: Linux -->
+      <rect x="608" y="80" width="288" height="144" rx="6" fill="#fafafa"/>
+      <rect x="608" y="80" width="288" height="144" rx="6" fill="#ffffff" stroke="#000000" stroke-width="1"/>
+      <rect x="616" y="86" width="44" height="12" rx="2" fill="none" stroke="rgba(0,0,0,0.40)" stroke-width="0.8"/>
+      <text x="638" y="95" fill="#000000" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HARNESS</text>
+      <text x="752" y="116" fill="#000000" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Agent sessions + hooks</text>
+      <text x="752" y="132" fill="#717273" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">each kb command is one ssh request</text>
+      <rect x="616" y="148" width="272" height="24" rx="4" fill="rgba(0,0,0,0.05)" stroke="#717273" stroke-width="0.8"/>
+      <text x="624" y="164" fill="#000000" font-size="12" font-family="'Geist', sans-serif">kb</text>
+      <text x="880" y="164" fill="#717273" font-size="9" font-family="'Geist Mono', monospace" text-anchor="end">KB_HOST · guest key</text>
+      <rect x="616" y="180" width="272" height="24" rx="4" fill="rgba(0,0,0,0.05)" stroke="#717273" stroke-width="0.8"/>
+      <text x="624" y="196" fill="#000000" font-size="12" font-family="'Geist', sans-serif">Spool</text>
+      <text x="880" y="196" fill="#717273" font-size="9" font-family="'Geist Mono', monospace" text-anchor="end">hook events that missed the host</text>
+
+      <!-- Guest: Windows -->
+      <rect x="608" y="332" width="288" height="144" rx="6" fill="#fafafa"/>
+      <rect x="608" y="332" width="288" height="144" rx="6" fill="#ffffff" stroke="#000000" stroke-width="1"/>
+      <rect x="616" y="338" width="44" height="12" rx="2" fill="none" stroke="rgba(0,0,0,0.40)" stroke-width="0.8"/>
+      <text x="638" y="347" fill="#000000" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HARNESS</text>
+      <text x="752" y="368" fill="#000000" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Agent sessions + hooks</text>
+      <text x="752" y="384" fill="#717273" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">each kb command is one ssh request</text>
+      <rect x="616" y="400" width="272" height="24" rx="4" fill="rgba(0,0,0,0.05)" stroke="#717273" stroke-width="0.8"/>
+      <text x="624" y="416" fill="#000000" font-size="12" font-family="'Geist', sans-serif">kb</text>
+      <text x="880" y="416" fill="#717273" font-size="9" font-family="'Geist Mono', monospace" text-anchor="end">KB_HOST · guest key</text>
+      <rect x="616" y="432" width="272" height="24" rx="4" fill="rgba(0,0,0,0.05)" stroke="#717273" stroke-width="0.8"/>
+      <text x="624" y="448" fill="#000000" font-size="12" font-family="'Geist', sans-serif">Spool</text>
+      <text x="880" y="448" fill="#717273" font-size="9" font-family="'Geist Mono', monospace" text-anchor="end">hook events that missed the host</text>
+
+      <!-- Legend -->
+      <line x1="40" y1="532" x2="920" y2="532" stroke="rgba(0,0,0,0.10)" stroke-width="0.8"/>
+      <text x="40" y="552" fill="#717273" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+      <rect x="40" y="564" width="16" height="12" rx="2" fill="rgba(217,0,0,0.07)" stroke="#d90000" stroke-width="1"/>
+      <text x="64" y="573" fill="#717273" font-size="8" font-family="'Geist', sans-serif">Board, the one store</text>
+      <rect x="180" y="564" width="16" height="12" rx="2" fill="rgba(217,0,0,0.05)" stroke="rgba(217,0,0,0.50)" stroke-width="1" stroke-dasharray="4,4"/>
+      <text x="204" y="573" fill="#717273" font-size="8" font-family="'Geist', sans-serif">Only entry for guests</text>
+      <rect x="324" y="564" width="16" height="12" rx="2" fill="rgba(113,114,115,0.10)" stroke="#8a8b8c" stroke-width="1"/>
+      <text x="348" y="573" fill="#717273" font-size="8" font-family="'Geist', sans-serif">Person</text>
+      <rect x="412" y="564" width="16" height="12" rx="2" fill="#ffffff" stroke="#000000" stroke-width="1"/>
+      <text x="436" y="573" fill="#717273" font-size="8" font-family="'Geist', sans-serif">Agent harness</text>
+      <rect x="528" y="564" width="16" height="12" rx="4" fill="rgba(0,0,0,0.05)" stroke="#717273" stroke-width="0.8"/>
+      <text x="552" y="573" fill="#717273" font-size="8" font-family="'Geist', sans-serif">Installed on the guest</text>
+      <rect x="672" y="564" width="28" height="12" rx="2" fill="rgba(0,0,0,0.02)" stroke="rgba(0,0,0,0.20)" stroke-width="0.8" stroke-dasharray="4,4"/>
+      <text x="708" y="573" fill="#717273" font-size="8" font-family="'Geist', sans-serif">Machine</text>
+      <line x1="788" y1="570" x2="816" y2="570" stroke="#717273" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <text x="824" y="573" fill="#717273" font-size="8" font-family="'Geist', sans-serif">kb call</text>
+    </svg>
+    </div>
+
+    <p class="note">kb authorize adds each guest key to the host's authorized_keys as command="&lt;kb&gt; serve --installation &lt;id&gt;",restrict, so the key runs nothing but kb serve. The host has no server process; ssh starts kb serve per request. A start, stop or end hook event that misses the host within 1 s stays in the guest's spool; the next such hook or kb spool --drain sends it. Curator actions run only on the host. Details: README, "Host and guests".</p>
+  </div>
+</body>
+</html>

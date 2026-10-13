@@ -1,6 +1,7 @@
 """Tests for guest mode (D9): kb forwarding over a fake ssh to kb serve, and kb authorize."""
 import json
 import os
+import shutil
 import pty
 import secrets
 import socket
@@ -10,7 +11,7 @@ import subprocess
 import time
 import unittest
 
-from test_kb import KB, REPO, KbCase, schema_objects
+from test_kb import KB, REPO, KbCase, context, schema_objects
 
 # Board schema version 4, as written by kb before guest mode (this commit's parent on main).
 V4_COMMIT = '9debe4b'
@@ -123,7 +124,7 @@ class ForwardingTest(GuestCase):
         tok = self.ok('start', '--as', 'gw', env=g)
         marker = os.path.join(self.tmp, 'pwned')
         title = 'it\'s "q" $(touch %s); `touch %s` ; rm -rf ~ ü€ \\ *' % (marker, marker)
-        tid = self.ok('add', title, '--repo', 'r', '--session', tok, env=g)
+        tid = self.ok('add', '--claim', title, '--repo', 'r', '--session', tok, env=g)
         self.assertEqual(self.query('SELECT title FROM ticket WHERE id=?', tid), [(title,)])
         self.assertFalse(os.path.exists(marker))
         # Inner whitespace, blank lines, CR LF and non-ASCII arrive byte for byte; kb strips
@@ -140,7 +141,7 @@ class ForwardingTest(GuestCase):
     def test_leading_bom_is_stripped_on_the_host(self):
         g = self.make_guest('laptop')
         tok = self.ok('start', '--as', 'gw', env=g)
-        tid = self.ok('add', 'bom', '--repo', 'r', '--session', tok, env=g)
+        tid = self.ok('add', '--claim', 'bom', '--repo', 'r', '--session', tok, env=g)
         for text in ('\ufeffpiped from PowerShell', 'keep \ufeff inside'):
             r = subprocess.run([KB, 'note', tid, '--session', tok], input=text.encode('utf-8'),
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=g,
@@ -153,8 +154,8 @@ class ForwardingTest(GuestCase):
         g = self.make_guest('laptop')
         gtok = self.ok('start', '--as', 'gw', env=g)
         htok = self.start('hw')
-        tid = self.ok('add', 'held by guest', '--repo', 'r', '--session', gtok, env=g)
-        hid = self.ok('add', 'other thing on the host', '--repo', 'r', '--session', htok)
+        tid = self.ok('add', '--claim', 'held by guest', '--repo', 'r', '--session', gtok, env=g)
+        hid = self.ok('add', '--claim', 'other thing on the host', '--repo', 'r', '--session', htok)
         # 1: rule rejection, compared with the same rejection on the host
         rg = self.kb('close', hid, '--session', gtok, env=g, stdin='x')
         other = self.start('other')
@@ -162,7 +163,7 @@ class ForwardingTest(GuestCase):
         self.assertEqual(rg.returncode, 1)
         self.assertEqual(rg.stderr, rl.stderr)
         # 2: needs --new
-        r = self.kb('add', 'held by guest', '--repo', 'r', '--session', gtok, env=g)
+        r = self.kb('add', '--claim', 'held by guest', '--repo', 'r', '--session', gtok, env=g)
         self.assertEqual(r.returncode, 2)
         self.assertIn('#%s doing held by guest' % tid, r.stdout)
         self.assertIn('rerun with --new', r.stderr)
@@ -176,7 +177,7 @@ class ForwardingTest(GuestCase):
     def test_board_with_open_stdin_pipe_does_not_hang(self):
         g = self.make_guest('laptop')
         tok = self.ok('start', '--as', 'gw', env=g)
-        self.ok('add', 'visible', '--repo', 'r', '--session', tok, env=g)
+        self.ok('add', '--claim', 'visible', '--repo', 'r', '--session', tok, env=g)
         p = subprocess.Popen([KB, 'board'], env=g, cwd=self.tmp, stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
@@ -253,7 +254,7 @@ class IdentityTest(GuestCase):
         self.git('-C', repo, 'commit', '-q', '--allow-empty', '-m', 'init')
         self.git('-C', repo, 'worktree', 'add', '-q', '-b', 'feat', wt)
         g = self.make_guest('laptop', CLAUDE_CODE_SESSION_ID='c-1')
-        tid = self.ok('add', 'guest work', env=g, cwd=wt)
+        tid = self.ok('add', '--claim', 'guest work', env=g, cwd=wt)
         self.assertEqual(self.query(
             'SELECT s.name, s.installation, s.harness, s.harness_session, s.host, t.repo,'
             ' t.host, t.worktree, t.branch FROM ticket t JOIN session s ON s.token=t.opener'
@@ -262,13 +263,13 @@ class IdentityTest(GuestCase):
               'mainrepo', socket.gethostname(), wt, 'feat')])
         self.assertIn('git:unknown', self.board_line(tid))
         # The same worktree held by a host session gets a real git hint.
-        hid = self.ok('add', 'unrelated item', '--session', self.start('h'), cwd=wt)
+        hid = self.ok('add', '--claim', 'unrelated item', '--session', self.start('h'), cwd=wt)
         self.assertNotIn('git:unknown', self.board_line(hid))
 
     def test_session_and_kb_session_through_the_guest(self):
         g = self.make_guest('laptop')
         tok = self.ok('start', '--as', 'gw', env=g)
-        tid = self.ok('add', 'a', '--repo', 'r', env=dict(g, KB_SESSION=tok))
+        tid = self.ok('add', '--claim', 'a', '--repo', 'r', env=dict(g, KB_SESSION=tok))
         self.ok('note', tid, '--session', tok, env=g, stdin='n')
         self.assertEqual(self.ticket(tid)[1], tok)
         # Several harness ids on the guest still need --harness, decided by the host.
@@ -285,7 +286,7 @@ class IdentityTest(GuestCase):
         out = self.ok('whoami', env=g, cwd=repo)
         self.assertIn('session: guestrepo/claude (not registered yet)', out)
         self.assertIn('installation: %s' % g['KB_INSTALLATION'], out)
-        tid = self.ok('add', 'guest task', env=g, cwd=repo)
+        tid = self.ok('add', '--claim', 'guest task', env=g, cwd=repo)
         token = self.query('SELECT opener FROM ticket WHERE id=?', tid)[0][0]
         out = self.ok('whoami', env=g, cwd=repo)
         self.assertEqual(out.splitlines()[0], 'name: guestrepo')
@@ -308,9 +309,9 @@ class IdentityTest(GuestCase):
         a = self.make_guest('a', CLAUDE_CODE_SESSION_ID='same')
         b = self.make_guest('b', CLAUDE_CODE_SESSION_ID='same')
         host = dict(self.env, CLAUDE_CODE_SESSION_ID='same')
-        ta = self.ok('add', 'work of a', '--repo', 'r', env=a)
-        tb = self.ok('add', 'work of b', '--repo', 'r2', env=b)
-        th = self.ok('add', 'work of host', '--repo', 'r3', env=host)
+        ta = self.ok('add', '--claim', 'work of a', '--repo', 'r', env=a)
+        tb = self.ok('add', '--claim', 'work of b', '--repo', 'r2', env=b)
+        th = self.ok('add', '--claim', 'work of host', '--repo', 'r3', env=host)
         rows = self.query("SELECT installation FROM session WHERE harness_session='same'")
         self.assertEqual(sorted(r[0] for r in rows),
                          sorted([a['KB_INSTALLATION'], b['KB_INSTALLATION'],
@@ -360,7 +361,7 @@ class ServeTest(GuestCase):
     def test_token_of_another_installation_is_rejected(self):
         a, b = self.make_guest('a'), self.make_guest('b')
         ta = self.ok('start', '--as', 'ga', env=a)
-        tid = self.ok('add', 'x', '--repo', 'r', '--session', ta, env=a)
+        tid = self.ok('add', '--claim', 'x', '--repo', 'r', '--session', ta, env=a)
         htok = self.start('hostside')
         for tok in (ta, htok, self.curator):
             r = self.kb('note', tid, '--session', tok, env=b, stdin='t')
@@ -387,7 +388,7 @@ class ServeTest(GuestCase):
     def test_stdin_body_over_1_mib_is_rejected(self):
         inst = 'cd' * 8
         tok = self.serve(self.request(['start', '--as', 'g']), inst).stdout.decode().strip()
-        tid = self.serve(self.request(['add', 'x', '--repo', 'r', '--session', tok]),
+        tid = self.serve(self.request(['add', '--claim', 'x', '--repo', 'r', '--session', tok]),
                          inst).stdout.decode().strip()
         limit = 1024 * 1024
         r = self.serve(self.request(['note', tid, '--session', tok], rest=b'y' * limit), inst)
@@ -400,7 +401,7 @@ class ServeTest(GuestCase):
         env = dict(self.env, SSH_CONNECTION='1 2 3 4', KB_SERVE_DEADLINE='1')
         inst = 'cd' * 8
         tok = self.serve(self.request(['start', '--as', 'g']), inst).stdout.decode().strip()
-        tid = self.serve(self.request(['add', 'x', '--repo', 'r', '--session', tok]),
+        tid = self.serve(self.request(['add', '--claim', 'x', '--repo', 'r', '--session', tok]),
                          inst).stdout.decode().strip()
         for partial in (self.request(['board'])[:20],  # inside the request line
                         self.request(['note', tid, '--session', tok], rest=b'half a body')):
@@ -437,8 +438,8 @@ class CuratorTest(GuestCase):
     def test_curator_actions_via_guest_rejected_but_work_on_host(self):
         g = self.make_guest('laptop')
         alice = self.start('alice')
-        held = self.ok('add', 'held', '--repo', 'r', '--session', alice)
-        todo = self.ok('add', 'req', '--type', 'request', '--to', 'x', '--session', alice)
+        held = self.ok('add', '--claim', 'held', '--repo', 'r', '--session', alice)
+        todo = self.ok('add', '--claim', 'req', '--type', 'request', '--to', 'x', '--session', alice)
         self.assertEqual(self.code('start', '--as', 'curator', env=g), 1)
         gtok = self.ok('start', '--as', 'gw', env=g)
         for argv in (['close', held, '--force'], ['release', held], ['abandon', todo]):
@@ -451,7 +452,7 @@ class CuratorTest(GuestCase):
 
     def test_harness_session_holding_the_curator_token_is_not_curator(self):
         alice = self.start('alice')
-        held = self.ok('add', 'held', '--repo', 'r', '--session', alice)
+        held = self.ok('add', '--claim', 'held', '--repo', 'r', '--session', alice)
         env = dict(self.env, CODEX_SESSION_ID='cx-1')
         r = self.kb('close', held, '--force', '--session', self.curator, env=env, stdin='x')
         self.assertEqual(r.returncode, 1)
@@ -512,7 +513,7 @@ class GuestHookTest(GuestCase):
         return r.stdout.decode().splitlines()
 
     def held_ticket(self, g, hsid):
-        tid = self.ok('add', 'work of %s' % hsid, '--repo', 'r-' + hsid,
+        tid = self.ok('add', '--claim', 'work of %s' % hsid, '--repo', 'r-' + hsid,
                       env=dict(g, CLAUDE_CODE_SESSION_ID=hsid))
         token = self.ticket(tid)[1]
         return tid, token
@@ -713,12 +714,12 @@ class GuestHookTest(GuestCase):
         g = self.make_guest('laptop')
         self.hook(g, 'start', 'p-1')
         name = self.query("SELECT name FROM session WHERE harness_session='p-1'")[0][0]
-        tid = self.ok('add', 'please look', '--type', 'request', '--to', name,
+        tid = self.ok('add', '--claim', 'please look', '--type', 'request', '--to', name,
                       '--session', self.curator)
         r, _ = self.hook(g, 'prompt', 'p-1')
-        self.assertIn('request #%s "please look"' % tid, r.stdout)
+        self.assertIn('request #%s "please look"' % tid, context(r.stdout))
         self.assertEqual(self.hook(g, 'prompt', 'p-1')[0].stdout, '')  # shown once
-        self.ok('add', 'second ask', '--type', 'request', '--to', name, '--session',
+        self.ok('add', '--claim', 'second ask', '--type', 'request', '--to', name, '--session',
                 self.curator)
         r, wall = self.hook(g, 'prompt', 'p-1', FAKE_SSH_MODE='slow')
         self.assertLess(wall, 1.5)
@@ -1004,10 +1005,7 @@ class AuthorizeTest(GuestCase):
 def old_kb(tmp):
     """kb as of V4_COMMIT, the last version with board schema version 4."""
     path = os.path.join(tmp, 'kb_v4')
-    src = subprocess.run(['git', '-C', REPO, 'show', '%s:kb' % V4_COMMIT], check=True,
-                         stdout=subprocess.PIPE).stdout
-    with open(path, 'wb') as f:
-        f.write(src)
+    shutil.copy(os.path.join(REPO, 'tests', 'fixtures', 'kb_v4'), path)  # git show V4_COMMIT:kb
     os.chmod(path, 0o755)
     return path
 
@@ -1024,7 +1022,7 @@ class MigrationV5Test(KbCase):
         tables = ('session', 'ticket', 'note', 'session_event', 'hint_seen')
         before = [self.query('SELECT * FROM %s ORDER BY 1' % t) for t in tables]
         self.assertIn('old', self.ok('board'))
-        self.assertEqual(self.query('PRAGMA user_version'), [(5,)])
+        self.assertEqual(self.query('PRAGMA user_version'), [(6,)])
         conf = os.path.join(self.home, '.config', 'agent-kanban', 'config')
         with open(conf) as f:
             inst = f.read().strip().split('=', 1)[1]

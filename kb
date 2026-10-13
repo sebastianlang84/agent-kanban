@@ -27,21 +27,23 @@ import threading
 import time
 import urllib.parse
 
-VERSION = '0.2.0'  # release number (SemVer); bumped in the commit tagged vVERSION
-SCHEMA_VERSION = 5
+VERSION = '0.3.0'  # release number (SemVer); bumped in the commit tagged vVERSION
+SCHEMA_VERSION = 6
 DEFAULT_DB = os.path.join('~', '.local', 'share', 'agent-kanban', 'board.sqlite')
 CURATOR = 'curator'
 OPEN = ('todo', 'doing', 'blocked')
 OWNED = ('doing', 'blocked')
 STATUS_ORDER = ('doing', 'blocked', 'todo', 'done', 'abandoned')
-SIMILARITY = 0.6
+SIMILARITY = 0.75  # difflib ratio of two titles
+SIMILARITY_WORDS = 0.6  # Jaccard of their word sets (catches reordered titles)
+BACKLOG = 'backlog'
 KNOWN_DAYS = 14  # kb sessions and the kb add --to check list the names seen in this many days
 KNOWN_MAX = 10  # names listed by the kb add --to warning
 
 EXIT_OK, EXIT_REJECTED, EXIT_CONFIRM, EXIT_USAGE = 0, 1, 2, 3
 SSH_FAILED = 255  # ssh's own exit code for a connection or authentication failure
 
-CONFIG_KEYS = ('KB_HOST', 'KB_INSTALLATION', 'KB_SSH_KEY')
+CONFIG_KEYS = ('KB_HOST', 'KB_INSTALLATION', 'KB_SSH_KEY', 'KB_DB')
 INSTALLATION_RE = re.compile(r'[0-9a-f]{16}')
 
 # Set by kb serve for one guest request (D9): the guest's context with the installation of
@@ -160,6 +162,30 @@ CREATE TRIGGER session_event_no_update BEFORE UPDATE ON session_event
     BEGIN SELECT RAISE(ABORT, 'session_event is append-only'); END;
 INSERT OR REPLACE INTO meta (key, value) VALUES ('installation', :installation);
 """,
+    # Note kind 'event': label changes, takeovers and events imported from the beelink board.
+    # A CHECK constraint cannot be altered, so note is rebuilt with its index and triggers.
+    5: """
+PRAGMA legacy_alter_table=OFF;
+CREATE TABLE note_v6 (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER NOT NULL REFERENCES ticket(id),
+    author    TEXT NOT NULL REFERENCES session(token),
+    time      TEXT NOT NULL,
+    kind      TEXT NOT NULL CHECK (kind IN ('comment', 'request', 'reply', 'close',
+                                           'release', 'force-close', 'session-ended',
+                                           'event')),
+    text      TEXT NOT NULL
+);
+INSERT INTO note_v6 (id, ticket_id, author, time, kind, text)
+    SELECT id, ticket_id, author, time, kind, text FROM note;
+DROP TABLE note;
+ALTER TABLE note_v6 RENAME TO note;
+CREATE INDEX note_ticket ON note(ticket_id);
+CREATE TRIGGER note_no_update BEFORE UPDATE ON note
+    BEGIN SELECT RAISE(ABORT, 'note is append-only'); END;
+CREATE TRIGGER note_no_delete BEFORE DELETE ON note
+    BEGIN SELECT RAISE(ABORT, 'note is append-only'); END;
+""",
 }
 
 SESSION_COLUMNS = ('token, name, harness, host, worktree, started, harness_session, last_seen,'
@@ -169,8 +195,8 @@ EVENT_COLUMNS = ('harness, harness_session, event, source, cwd, time, installati
 
 # Harness session id variables, in the order kb checks them.
 HARNESS_ENV = (('claude', 'CLAUDE_CODE_SESSION_ID'), ('codex', 'CODEX_SESSION_ID'),
-               ('pi', 'PI_SESSION_ID'))
-HARNESSES = tuple(h for h, _ in HARNESS_ENV)
+               ('codex', 'CODEX_THREAD_ID'), ('pi', 'PI_SESSION_ID'))
+HARNESSES = ('claude', 'codex', 'pi')
 HOOK_EVENTS = ('start', 'stop', 'end', 'prompt', 'guard')
 HOOK_BUSY_MS = 1000  # SessionEnd budgets: Claude Code 1.5 s, codex 3 s
 
@@ -403,11 +429,33 @@ def env(key):
     return (GUEST['env'] if GUEST else os.environ).get(key)
 
 
+def board_file():
+    """Absolute path of the board: KB_DB from the environment or the config, else the default."""
+    try:
+        configured = setting('KB_DB')
+    except (OSError, ValueError):
+        configured = os.environ.get('KB_DB', '')
+    return os.path.abspath(os.path.expanduser(configured or DEFAULT_DB))
+
+
+def tracked_in_git(path):
+    """True if path lies inside a git working tree and git does not ignore it (D8)."""
+    if not inside_git_tree(path):
+        return False
+    d = path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
+    try:
+        r = subprocess.run(['git', '-C', d, 'check-ignore', '-q', '--', os.path.abspath(path)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return r.returncode != 0
+
+
 def db_path():
-    path = os.path.expanduser(os.environ.get('KB_DB') or DEFAULT_DB)
-    os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
-    # D8: ticket data never lives inside a git working tree.
-    if inside_git_tree(path):
+    path = board_file()
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    # D8: ticket data never lives in a git working tree, unless git ignores it there.
+    if tracked_in_git(path):
         raise UsageError('database path is inside a git working tree: %s' % path)
     return path
 
@@ -433,6 +481,8 @@ def migrate(conn):
     if version > SCHEMA_VERSION:
         raise UsageError('database schema version %d, kb supports %d'
                          % (version, SCHEMA_VERSION))
+    legacy = version == 0 and conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tickets'").fetchone()
     if version == 0:
         run_script(conn, SCHEMA)
         version = 1
@@ -440,7 +490,95 @@ def migrate(conn):
         params = {'installation': host_installation(conn)} if version == 4 else None
         run_script(conn, MIGRATIONS[version], params)
         version += 1
+    if legacy:
+        migrate_legacy(conn)
     conn.execute('PRAGMA user_version=%d' % SCHEMA_VERSION)
+
+
+# --- import of the beelink board (kb.py 1.x: tables sessions, tickets, notes, shown) -------
+
+LEGACY_STATUS = {'open': 'todo', 'claimed': 'doing', 'closed': 'done'}
+LEGACY_KIND = {'note': 'comment', 'reply': 'reply', 'result': 'close', 'event': 'event'}
+LEGACY_HARNESS = ('claude', 'codex', 'pi', 'cli')
+
+
+def epoch_iso(ts):
+    if ts is None:
+        return None
+    return datetime.datetime.fromtimestamp(float(ts), datetime.timezone.utc).strftime(
+        '%Y-%m-%dT%H:%M:%SZ')
+
+
+def migrate_legacy(conn):
+    """Inside migrate's write transaction: move the old board's rows into this schema.
+
+    Ticket and note ids, note text and existing session tokens are kept, so references in
+    other systems and saved tokens stay valid. A session id `<harness>:<id>` gives the harness
+    and its session id; a closed request without a reply was withdrawn and becomes abandoned.
+    The old shown marks are dropped: hints_since is the migration time, so nothing old is
+    hinted again. The old tables are dropped at the end.
+    """
+    inst = host_installation(conn)
+    tokens = {}
+    for sid, harness, name, cwd, host, token, started, last in conn.execute(
+            'SELECT id, harness, name, cwd, host, token, started_at, last_activity'
+            ' FROM sessions ORDER BY started_at, id'):
+        prefix, _, rest = sid.partition(':')
+        if sid == CURATOR:
+            h, hsid = 'human', ''
+        elif rest and prefix in LEGACY_HARNESS:
+            h, hsid = prefix, ('' if prefix == 'cli' else rest)
+        else:
+            h, hsid = harness or '', ''
+        tok = token or secrets.token_hex(16)
+        conn.execute('INSERT INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                     % SESSION_COLUMNS, (tok, name, h, host or '', cwd or '', epoch_iso(started),
+                                         hsid, epoch_iso(last), inst))
+        tokens[sid] = tok
+
+    def author(sid, name, ts):
+        """Token for a session id the old board referenced without a sessions row."""
+        if sid not in tokens:
+            tok = secrets.token_hex(16)
+            conn.execute('INSERT INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                         % SESSION_COLUMNS, (tok, name or sid, sid if sid == 'kb' else '', '',
+                                             '', epoch_iso(ts), '', epoch_iso(ts), inst))
+            tokens[sid] = tok
+        return tokens[sid]
+
+    replied = {r[0] for r in conn.execute("SELECT DISTINCT ticket_id FROM notes WHERE kind='reply'")}
+    for (tid, ttype, title, repo, labels, status, creator, creator_name, to_name, owner,
+         owner_name, created, claimed, closed, activity) in conn.execute(
+            'SELECT id, type, title, repo, labels, status, creator_session, creator_name, to_name,'
+            ' owner_session, owner_name, created_at, claimed_at, closed_at, last_activity'
+            ' FROM tickets ORDER BY id').fetchall():
+        new = LEGACY_STATUS[status]
+        if new == 'done' and ttype == 'request' and tid not in replied:
+            new = 'abandoned'
+        opener = author(creator, creator_name, created)
+        assignee = author(owner, owner_name, claimed or created) if owner else None
+        updated = max(x for x in (activity, closed, created) if x is not None)
+        conn.execute(
+            'INSERT INTO ticket (id, type, title, repo, status, addressee, assignee, opener,'
+            ' labels, created, updated, claimed_at, last_activity)'
+            ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (tid, ttype, title, repo or '', new, to_name, assignee, opener, labels or '',
+             epoch_iso(created), epoch_iso(updated), epoch_iso(claimed), epoch_iso(activity)))
+    for nid, tid, sid, name, kind, body, created in conn.execute(
+            'SELECT id, ticket_id, session_id, author_name, kind, body, created_at FROM notes'
+            ' ORDER BY id').fetchall():
+        conn.execute('INSERT INTO note (id, ticket_id, author, time, kind, text)'
+                     ' VALUES (?, ?, ?, ?, ?, ?)',
+                     (nid, tid, author(sid, name, created), epoch_iso(created),
+                      LEGACY_KIND.get(kind, 'comment'), body))
+    seq = dict(conn.execute('SELECT name, seq FROM sqlite_sequence'))
+    for old, new in (('tickets', 'ticket'), ('notes', 'note')):
+        high = max(seq.get(old) or 0, seq.get(new) or 0)
+        conn.execute('UPDATE sqlite_sequence SET seq=? WHERE name=?', (high, new))
+    for table in ('shown', 'notes', 'tickets', 'sessions'):
+        conn.execute('DROP TABLE IF EXISTS %s' % table)
+    conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('tickets', 'notes')")
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('legacy_import', ?)", (now(),))
 
 
 def connect(busy_ms=10000):
@@ -487,19 +625,89 @@ def read_text(required):
     return text.strip()
 
 
-def harness_id(pick=None):
-    """(harness, id) from the harness session id variables, or None.
+def harness_ids():
+    """{harness: id} from the harness session id variables of the caller.
 
-    Nested harnesses inherit each other's variables, so several set ones need pick.
+    codex sets CODEX_SESSION_ID or CODEX_THREAD_ID depending on its version; the pi adapter
+    exports its id as KB_SESSION=pi:<id> (pi itself sets no session variable).
     """
-    found = [(h, env(v).strip()) for h, v in HARNESS_ENV if (env(v) or '').strip()]
+    found = {}
+    for h, v in HARNESS_ENV:
+        value = (env(v) or '').strip()
+        if value and h not in found:
+            found[h] = value
+    pi = (env('KB_SESSION') or '').strip()
+    if pi.startswith('pi:') and pi[3:].strip() and 'pi' not in found:
+        found['pi'] = pi[3:].strip()
+    return found
+
+
+def _proc(pid):
+    """(ppid, comm, argv) of a process from /proc, or None."""
+    try:
+        with open('/proc/%d/stat' % pid) as f:
+            ppid = int(f.read().rsplit(')', 1)[1].split()[1])
+        with open('/proc/%d/comm' % pid) as f:
+            comm = f.read().strip()
+        with open('/proc/%d/cmdline' % pid, 'rb') as f:
+            argv = [a.decode(errors='replace') for a in f.read().split(b'\0') if a]
+        return ppid, comm, argv
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _harness_of(comm, argv):
+    head = os.path.basename(argv[0]) if argv else ''
+    if comm == 'claude' or head == 'claude':
+        return 'claude'
+    if comm.startswith('codex') or head == 'codex':
+        return 'codex'
+    if head == 'pi' or any('pi-coding-agent' in a for a in argv[:2]) or (
+            len(argv) > 1 and os.path.basename(argv[1]) == 'pi'):
+        return 'pi'
+    return None
+
+
+def harness_in_proc():
+    """The agent harness closest above this process (Linux /proc), or None.
+
+    KB_TEST_NO_PROC=1 skips the walk, so the test suite can run inside an agent harness.
+    """
+    if GUEST or os.environ.get('KB_TEST_NO_PROC') == '1' or not os.path.exists('/proc/self/stat'):
+        return None
+    pid, seen = os.getppid(), 0
+    while pid > 1 and seen < 40:
+        info = _proc(pid)
+        if not info:
+            return None
+        ppid, comm, argv = info
+        found = _harness_of(comm, argv)
+        if found:
+            return found
+        pid, seen = ppid, seen + 1
+    return None
+
+
+def harness_id(pick=None):
+    """(harness, id) of the calling harness session, or None.
+
+    Nested harnesses (a codex call from a Claude session) inherit each other's variables.
+    pick (--harness), else KB_HARNESS (`none`: no harness), else the nearest harness process
+    above this one decides which applies; without /proc several set ids need --harness.
+    """
+    found = harness_ids()
+    pick = pick or (None if GUEST else (os.environ.get('KB_HARNESS') or '').strip() or None)
+    if pick == 'none':
+        return None
     if pick:
-        found = [f for f in found if f[0] == pick]
-    elif len(found) > 1:
+        return (pick, found[pick]) if pick in found else None
+    if len(found) > 1:
+        near = harness_in_proc()
+        if near in found:
+            return near, found[near]
         raise UsageError('several harness session ids are set (%s); pass --harness <%s>'
-                         % (', '.join(v for h, v in HARNESS_ENV if h in dict(found)),
-                            '|'.join(h for h, _ in found)))
-    return found[0] if found else None
+                         % (', '.join(sorted(found)), '|'.join(sorted(found))))
+    return next(iter(found.items())) if found else None
 
 
 def safe_name(base):
@@ -545,16 +753,37 @@ def register(conn, harness, hsid, cwd):
     return row
 
 
+def curator_session(conn):
+    """Token and name of the curator's session on this host, created on first use."""
+    inst = host_installation(conn)
+    row = conn.execute('SELECT token, name FROM session WHERE name=? AND installation=?'
+                       ' ORDER BY started LIMIT 1', (CURATOR, inst)).fetchone()
+    if row is None:
+        t = now()
+        with transaction(conn):
+            token = secrets.token_hex(16)
+            conn.execute('INSERT INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                         % SESSION_COLUMNS, (token, CURATOR, 'human', socket.gethostname(),
+                                             '', t, '', t, inst))
+        row = (token, CURATOR)
+    return tuple(row)
+
+
 def session(conn, args):
-    token = args.session
+    token = getattr(args, 'session', None)
     if not token:
         # A harness id outranks KB_SESSION, which a nested run may inherit from its parent.
         hid = harness_id(getattr(args, 'harness', None))
         if hid is not None:
             return tuple(register(conn, hid[0], hid[1], os.getcwd()))
         token = env('KB_SESSION')
+        if token and token.startswith('pi:'):
+            token = None  # the pi adapter's harness id, not a token
         if not token:
-            raise UsageError('missing session token: pass --session <token> (from kb start)')
+            if human_terminal():  # a human at a plain terminal acts as the curator
+                return curator_session(conn)
+            raise UsageError('no session found, and only a human at a terminal acts as curator;'
+                             ' run kb start --as <name> and pass --session <token>')
     row = conn.execute('SELECT token, name, installation FROM session WHERE token=?',
                        (token,)).fetchone()
     if row is None:
@@ -567,10 +796,28 @@ def session(conn, args):
     return row[0], row[1]
 
 
+def has_tty():
+    try:
+        os.close(os.open('/dev/tty', os.O_RDWR))
+        return True
+    except OSError:
+        return False
+
+
+def human_terminal():
+    """A human at a plain terminal on the host: no agent harness above, a controlling tty.
+
+    Agent tool shells have no controlling terminal. This guards against mistakes; it is not
+    authentication, since any process of the same user can open the database directly.
+    """
+    return (GUEST is None and not harness_ids() and harness_in_proc() is None
+            and (os.environ.get('KB_HARNESS') or 'none') == 'none' and has_tty())
+
+
 def is_curator(name):
     """Curator rights need the name, a caller on the host itself, and no harness session id."""
-    return (name == CURATOR and GUEST is None
-            and not any(os.environ.get(v, '').strip() for _, v in HARNESS_ENV))
+    return (name == CURATOR and GUEST is None and not harness_ids()
+            and harness_in_proc() is None)
 
 
 def describe(conn, ticket_id):
@@ -615,8 +862,11 @@ def reason(conn, ticket_id, action, me=None, name=None):
         return '%s; %s needs %s' % (describe(conn, ticket_id), verb, ' or '.join(statuses))
     if action == 'claim':  # mirrors CLAIM_SQL
         if assignee is not None:
-            return ('%s; claim needs a todo ticket without assignee, and this one is still held'
-                    % describe(conn, ticket_id))
+            gone = holder_gone(conn, ticket_id)
+            return ('%s; claim needs a todo ticket without assignee, and this one is still held%s'
+                    % (describe(conn, ticket_id),
+                       '; its holder is %s, so kb claim --take %s takes it over' % (gone, ticket_id)
+                       if gone else ''))
         if addressee == '':
             return ('%s; its addressee is empty, so no session can claim it'
                     % describe(conn, ticket_id))
@@ -663,9 +913,10 @@ def recovering(conn):
 def transition(args, action, sql, params, kind, default_text):
     """Guarded status change plus its note, in one IMMEDIATE transaction.
 
-    params(token, name) returns the SQL parameters for the calling session.
+    params(token, name) returns the SQL parameters for the calling session. The note text is
+    --why, else stdin with --stdin, else default_text.
     """
-    text = read_text(False) if args.stdin else ''
+    text = (getattr(args, 'why', None) or '').strip() or (read_text(False) if args.stdin else '')
     conn = connect()
     me, name = session(conn, args)
     with transaction(conn):
@@ -681,28 +932,60 @@ def cmd_start(args):
     name = args.name.strip()
     if not name or name.split() != [name] or name == 'any':
         raise UsageError('invalid session name: %r' % args.name)
+    if args.cwd is not None and args.worktree is None:
+        args.worktree = git(os.path.expanduser(args.cwd), 'rev-parse', '--show-toplevel') \
+            or os.path.abspath(os.path.expanduser(args.cwd))
     host, worktree, _ = exec_meta(args)
-    hid = harness_id(args.harness if args.harness in HARNESSES else None)
     if name == CURATOR and GUEST:
         raise Rejected('start rejected: the curator acts on the host only')
     conn = connect()
     inst = installation(conn)
-    if hid is not None:
-        if name == CURATOR:  # agents always carry a harness id; the curator uses a plain shell
-            raise Rejected('start rejected: a harness session cannot be the curator')
-        # The harness already identifies this session: name (or rename) it.
-        with transaction(conn):
-            row = insert_harness_session(conn, inst, hid[0], hid[1], name, worktree)
-            conn.execute('UPDATE session SET name=?, last_seen=? WHERE token=?',
-                         (name, now(), row[0]))
-        print(row[0])
-        return
-    token = secrets.token_hex(8)
+    if name == CURATOR and (harness_ids() or harness_in_proc()):
+        # agents always run inside a harness; the curator uses a plain shell
+        raise Rejected('start rejected: a harness session cannot be the curator')
+    # Always a new token session, also inside a harness: scripts and other machines (ssh)
+    # start their own identity this way. kb name renames the calling harness session.
+    token = secrets.token_hex(16)
     t = now()
     with transaction(conn):
         conn.execute('INSERT INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-                     % SESSION_COLUMNS, (token, name, args.harness, host, worktree, t, '', t, inst))
+                     % SESSION_COLUMNS, (token, name, args.harness if args.harness != 'none'
+                                         else '', host, worktree, t, '', t, inst))
     print(token)
+
+
+def cmd_name(args):
+    """Rename the calling session; tickets and requests follow, since they hold its token."""
+    name = args.name.strip()
+    if not name or name.split() != [name] or name in ('any', CURATOR):
+        raise UsageError('invalid session name: %r' % args.name)
+    conn = connect()
+    me, old = session(conn, args)
+    with transaction(conn):
+        conn.execute('UPDATE session SET name=?, last_seen=? WHERE token=?', (name, now(), me))
+    print('session %s is now %s' % (old, name))
+
+
+def cmd_end(args):
+    """End a token session (kb start); its tickets get a session-ended note and stay held."""
+    conn = connect()
+    me, name = session(conn, args)
+    with transaction(conn):
+        n = note_session_ended(conn, me)
+        conn.execute('UPDATE session SET last_seen=? WHERE token=?', (now(), me))
+    print('session %s ended; session-ended noted on %d held ticket(s)' % (name, n))
+
+
+def title_words(title):
+    return {w for w in re.findall(r'[\w-]+', title.lower()) if len(w) > 2}
+
+
+def similar_titles(a, b):
+    """Two titles name the same work: close as strings, or sharing most of their words."""
+    if difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio() >= SIMILARITY:
+        return True
+    wa, wb = title_words(a), title_words(b)
+    return bool(wa | wb) and len(wa & wb) / len(wa | wb) >= SIMILARITY_WORDS
 
 
 def cmd_add(args):
@@ -716,16 +999,27 @@ def cmd_add(args):
     host, worktree, branch = exec_meta(args)
     repo = args.repo
     if repo is None:
-        if args.type != 'task' or not worktree:
+        if not worktree:
             repo = ''
         elif GUEST:  # repo_name ran on the guest, for its own toplevel only
             repo = GUEST['repo'] if worktree == GUEST['toplevel'] else ''
         else:
             repo = repo_name(worktree)
-    text = read_text(False) if args.stdin else ''
+    labels = sorted({l.strip() for l in args.label if l.strip()})
+    if BACKLOG in labels and args.type == 'request':
+        raise UsageError('requests cannot go to the backlog; answer or withdraw them')
+    if BACKLOG in labels and args.claim:
+        raise UsageError('a backlog ticket is parked, not claimed')
+    labels = ','.join(labels)
+    text = (args.note or '').strip() or (read_text(False) if args.stdin else '')
     conn = connect()
     me, _ = session(conn, args)
-    labels = ','.join(l.strip() for l in args.label if l.strip())
+    # A harness session (or the curator) adds a task to work on it now; a token session
+    # (a script, another machine) usually files work for later. --claim / --todo decide.
+    claim = args.claim or not (args.todo or getattr(args, 'session', None)
+                               or (env('KB_SESSION') or '').strip() and not harness_ids())
+    if BACKLOG in labels.split(','):
+        claim = False
     t = now()
     with transaction(conn):
         if recovering(conn):
@@ -733,15 +1027,13 @@ def cmd_add(args):
         if not args.new:
             similar = [r for r in conn.execute(
                 'SELECT id, status, title FROM ticket WHERE repo=? AND status IN (?, ?, ?)',
-                (repo,) + OPEN)
-                if difflib.SequenceMatcher(None, title.lower(), r[2].lower()).ratio()
-                >= SIMILARITY]
+                (repo,) + OPEN) if similar_titles(title, r[2])]
             if similar:
                 for r in similar:
                     print('#%d %s %s' % r)
-                raise NeedsConfirm('similar open tickets in repo %r; rerun with --new to add anyway'
-                                   % repo)
-        if args.type == 'task':
+                raise NeedsConfirm('similar open tickets in repo %r: claim one, or rerun with'
+                                   ' --new if the task is really different' % repo)
+        if args.type == 'task' and claim:
             status, assignee, claimed = 'doing', me, t
         else:
             status, assignee, claimed = 'todo', None, None
@@ -753,8 +1045,11 @@ def cmd_add(args):
             (args.type, title, repo, status, args.to, assignee, me, labels, t, t, claimed, t,
              host, worktree, branch, args.merge_target))
         ticket_id = cur.lastrowid
-        if text:
-            add_note(conn, ticket_id, me, 'request' if args.type == 'request' else 'comment', text)
+        if args.type == 'request':
+            # notify.d hooks and kb-watch react to notes; without one a request goes unnoticed
+            add_note(conn, ticket_id, me, 'request', text or '(request text is in the title)')
+        elif text:
+            add_note(conn, ticket_id, me, 'comment', text)
     print(ticket_id)
     if args.to not in (None, 'any', CURATOR) and conn.execute(
             'SELECT 1 FROM session WHERE name=?', (args.to,)).fetchone() is None:
@@ -763,10 +1058,41 @@ def cmd_add(args):
                          % (args.to, ', '.join(known) or '-'))
 
 
+def holder_gone(conn, ticket_id):
+    """Why a held ticket may be taken over: 'session-ended' and/or 'idle>Nh', else ''.
+
+    session-ended counts only when no start or stop of the holder followed its end note, as
+    on the board: a resumed session keeps its tickets."""
+    hours, cutoff = stale_cutoff()
+    row = conn.execute(
+        'SELECT t.last_activity, t.claimed_at, s.harness, s.harness_session, s.installation,'
+        " (SELECT max(n.time) FROM note n WHERE n.ticket_id=t.id AND n.kind='session-ended'"
+        '  AND n.author=t.assignee AND n.time>=coalesce(t.claimed_at, \'\'))'
+        ' FROM ticket t JOIN session s ON s.token=t.assignee WHERE t.id=?'
+        " AND t.status IN ('doing', 'blocked')", (ticket_id,)).fetchone()
+    if row is None:
+        return ''
+    activity, _, harness, hsid, inst, ended = row
+    why = []
+    if ended and not (hsid and conn.execute(
+            "SELECT 1 FROM session_event WHERE installation=? AND harness=? AND harness_session=?"
+            " AND event IN ('start', 'stop') AND time>?", (inst, harness, hsid, ended)).fetchone()):
+        why.append('session-ended')
+    if parse_time(activity) < cutoff:
+        why.append('idle>%gh' % hours)
+    return ','.join(why)
+
+
 def cmd_claim(args):
     host, worktree, branch = exec_meta(args)
     conn = connect()
     me, name = session(conn, args)
+    if getattr(args, 'take', False):
+        return take_over(conn, args, me, name, host, worktree, branch)
+    row = conn.execute('SELECT status, assignee FROM ticket WHERE id=?', (args.id,)).fetchone()
+    if row and row[1] == me and row[0] in OWNED:
+        print('ticket %d: already yours' % args.id)
+        return
     t = now()
     params = (me, t, t, t, host, worktree, branch, args.id, name)
     with transaction(conn):
@@ -776,6 +1102,42 @@ def cmd_claim(args):
         require(conn, cur.rowcount == 1, args.id, 'claim', me, name)
         add_note(conn, args.id, me, 'comment', 'claimed')
     print('ticket %d: claimed' % args.id)
+
+
+def take_over(conn, args, me, name, host, worktree, branch):
+    """claim --take: a held ticket whose holder ended (and did not resume) or went idle."""
+    t = now()
+    with transaction(conn):
+        if recovering(conn):
+            raise Rejected(RECOVERY)
+        row = conn.execute('SELECT status, assignee, type, addressee FROM ticket WHERE id=?',
+                           (args.id,)).fetchone()
+        require(conn, row is not None, args.id, 'claim')
+        if row[0] not in OWNED:
+            raise Rejected('claim --take rejected: %s; take over needs doing or blocked, a todo'
+                           ' ticket is claimed with kb claim %d' % (describe(conn, args.id),
+                                                                 args.id))
+        if row[1] == me:
+            print('ticket %d: already yours' % args.id)
+            return
+        if row[2] == 'request' and row[3] not in (None, 'any', name):
+            raise Rejected('claim --take rejected: request %d is addressed to %s'
+                           % (args.id, row[3]))
+        why = holder_gone(conn, args.id)
+        if not why:
+            raise Rejected('claim --take rejected: %s, and its holder is neither ended nor idle;'
+                           ' ask it with a request, or ask the curator to release it'
+                           % describe(conn, args.id))
+        holder = describe(conn, args.id)
+        cur = conn.execute(
+            "UPDATE ticket SET status='doing', assignee=?, claimed_at=?, updated=?,"
+            ' last_activity=?, host=?, worktree=?, branch=? WHERE id=? AND assignee=?'
+            " AND status IN ('doing', 'blocked')",
+            (me, t, t, t, host, worktree, branch, args.id, row[1]))
+        require(conn, cur.rowcount == 1, args.id, 'claim', me, name)
+        add_note(conn, args.id, me, 'event', 'taken over (%s; %s)' % (why, holder))
+        add_note(conn, args.id, me, 'comment', 'claimed')
+    print('ticket %d: taken over (%s)' % (args.id, why))
 
 
 def cmd_block(args):
@@ -813,11 +1175,35 @@ def cmd_reopen(args):
                lambda me, name: (now(), args.id, me, is_curator(name)), 'comment', 'reopened')
 
 
+def closing_text(args, kind):
+    """The closing note: --where/--changed/--open as three lines, else --result, else stdin."""
+    parts = (args.where, args.changed, args.open)
+    if any(p is not None for p in parts):
+        if not all(p and p.strip() for p in parts):
+            raise UsageError('close a task with all three of --where (deployed where), --changed'
+                             " (what changed) and --open (what is open; 'nothing' if so)")
+        return 'deployed: %s\nchanged: %s\nopen: %s' % tuple(p.strip() for p in parts)
+    if args.result and args.result.strip():
+        return args.result.strip()
+    return read_text(kind == 'task')
+
+
 def cmd_close(args):
     conn = connect()
     me, name = session(conn, args)
-    text = read_text(True)
     t = now()
+    row = conn.execute('SELECT type, status, assignee, opener FROM ticket WHERE id=?',
+                       (args.id,)).fetchone()
+    if row is not None and row[0] == 'request' and args.withdraw:
+        return withdraw(conn, args, me, name, row)
+    text = closing_text(args, row[0] if row else 'task') if row else ''
+    if row is not None and row[0] == 'request' and not text:
+        text = 'closed'
+    # The curator closes another session's held ticket only on purpose: --force, or a plain
+    # close of a ticket nobody holds.
+    if row is not None and is_curator(name) and row[2] not in (None, me) and not args.force:
+        raise Rejected('close rejected: %s; the curator closes it with kb close --force'
+                       % describe(conn, args.id))
     with transaction(conn):
         row = conn.execute('SELECT type FROM ticket WHERE id=?', (args.id,)).fetchone()
         require(conn, row is not None, args.id, 'close')
@@ -830,18 +1216,25 @@ def cmd_close(args):
             kind = 'force-close'
             action = 'close --force'
         elif row[0] == 'task':
+            # The assignee closes; a todo task nobody holds closes by its opener or the curator.
             cur = conn.execute(
                 "UPDATE ticket SET status='done', updated=? WHERE id=?"
-                " AND status IN ('doing', 'blocked') AND assignee=?", (t, args.id, me))
+                " AND (status IN ('doing', 'blocked') AND assignee=?"
+                "      OR status='todo' AND assignee IS NULL AND (opener=? OR ?))",
+                (t, args.id, me, me, is_curator(name)))
             kind = 'close'
             action = 'close'
         else:
-            # A request closes once it has a reply, by its opener or its assignee (D3).
+            # A request closes once it has a reply, by its opener, its assignee or the curator
+            # (D3); a session of the opener's name may close it too, since a successor session
+            # of that name sees the reply.
             cur = conn.execute(
                 "UPDATE ticket SET status='done', updated=? WHERE id=?"
-                " AND status IN ('todo', 'doing', 'blocked') AND (opener=? OR assignee=?)"
+                " AND status IN ('todo', 'doing', 'blocked')"
+                " AND (opener=? OR assignee=? OR ? OR (SELECT name FROM session"
+                "      WHERE token=ticket.opener)=?)"
                 " AND EXISTS (SELECT 1 FROM note WHERE ticket_id=ticket.id AND kind='reply')",
-                (t, args.id, me, me))
+                (t, args.id, me, me, is_curator(name), name))
             kind = 'close'
             action = 'close request'
         require(conn, cur.rowcount == 1, args.id, action, me, name)
@@ -849,15 +1242,73 @@ def cmd_close(args):
     print('ticket %d: done' % args.id)
 
 
+def withdraw(conn, args, me, name, row):
+    """close --withdraw: a request without a reply is dropped (abandoned) by its opener, a
+    session of the opener's name, or the curator."""
+    text = (args.result or '').strip() or 'withdrawn'
+    with transaction(conn):
+        cur = conn.execute(
+            "UPDATE ticket SET status='abandoned', assignee=NULL, updated=? WHERE id=?"
+            " AND type='request' AND status IN ('todo', 'doing', 'blocked')"
+            " AND NOT EXISTS (SELECT 1 FROM note WHERE ticket_id=ticket.id AND kind='reply')"
+            " AND (opener=? OR ? OR (SELECT name FROM session WHERE token=ticket.opener)=?)",
+            (now(), args.id, me, is_curator(name), name))
+        if cur.rowcount != 1:
+            replied = conn.execute("SELECT 1 FROM note WHERE ticket_id=? AND kind='reply'",
+                                   (args.id,)).fetchone()
+            raise Rejected('withdraw rejected: %s; %s' % (
+                describe(conn, args.id),
+                'it has a reply, so close it without --withdraw' if replied else
+                'only its opener or the curator withdraws a request'))
+        add_note(conn, args.id, me, 'comment', text)
+    print('ticket %d: abandoned (withdrawn)' % args.id)
+
+
 def cmd_note(args):
     conn = connect()
     me, _ = session(conn, args)
-    text = read_text(True)
+    kind = 'reply' if args.reply else args.kind
+    words = ' '.join(args.text).strip()
+    text = read_text(True) if words in ('', '-') else words
     with transaction(conn):
-        cur = conn.execute('UPDATE ticket SET updated=? WHERE id=?', (now(), args.id))
-        require(conn, cur.rowcount == 1, args.id, 'note')
-        add_note(conn, args.id, me, args.kind, text)
-    print('ticket %d: %s noted' % (args.id, args.kind))
+        row = conn.execute('SELECT type, assignee FROM ticket WHERE id=?', (args.id,)).fetchone()
+        require(conn, row is not None, args.id, 'note')
+        if kind == 'reply':
+            # The session answering a request holds it, so the board shows who answers.
+            if row[0] != 'request':
+                raise Rejected('note --reply rejected: ticket %d is a task; replies answer'
+                               ' requests' % args.id)
+            if row[1] != me:
+                raise Rejected('note --reply rejected: claim request %d before replying'
+                               ' (kb claim %d)' % (args.id, args.id))
+        conn.execute('UPDATE ticket SET updated=? WHERE id=?', (now(), args.id))
+        add_note(conn, args.id, me, kind, text)
+    print('ticket %d: %s noted' % (args.id, kind))
+
+
+def cmd_label(args):
+    """Add or remove labels: kb label 12 backlog, kb label 12 --remove backlog."""
+    if not (args.labels or args.remove):
+        raise UsageError('name labels to add, or --remove <label>')
+    conn = connect()
+    me, _ = session(conn, args)
+    with transaction(conn):
+        row = conn.execute('SELECT type, labels, status FROM ticket WHERE id=?',
+                           (args.id,)).fetchone()
+        require(conn, row is not None, args.id, 'label')
+        labels = {l for l in row[1].split(',') if l}
+        labels |= {l.strip().lstrip('+') for l in args.labels if l.strip().lstrip('+')}
+        labels -= {l.strip() for l in args.remove}
+        if any(',' in l for l in labels):
+            raise UsageError('a label contains no comma')
+        if BACKLOG in labels and row[0] == 'request':
+            raise Rejected('requests cannot go to the backlog; answer or withdraw them')
+        new = ','.join(sorted(labels))
+        if new != row[1]:
+            conn.execute('UPDATE ticket SET labels=?, updated=? WHERE id=?',
+                         (new, now(), args.id))
+            add_note(conn, args.id, me, 'event', 'labels: %s' % (new or '-'), activity=False)
+    print('ticket %d: labels %s' % (args.id, new or '-'))
 
 
 def cmd_touch(args):
@@ -899,8 +1350,7 @@ def cmd_session_ended(args):
 
 def data_dir():
     """Directory of the database; on a guest it holds only hook-errors.log and the spool."""
-    return os.path.dirname(os.path.abspath(os.path.expanduser(os.environ.get('KB_DB')
-                                                              or DEFAULT_DB)))
+    return os.path.dirname(board_file())
 
 
 def hook_log_path():
@@ -1314,8 +1764,7 @@ def run_hook(args):
             conn.execute('UPDATE session SET last_seen=? WHERE token=?', (now(), row[0]))
             text = prompt_hints(conn, row[0], row[1])
             if text:  # written before COMMIT: a failed write rolls the seen marks back
-                sys.stdout.write(text + '\n')
-                sys.stdout.flush()
+                emit(args, 'UserPromptSubmit', text)
         return
     t = now()
     ev.update(inst=host_installation(conn), event_id=None, time=t, received=t, live=True)
@@ -1325,6 +1774,45 @@ def run_hook(args):
         ev['name'], ev['toplevel'] = derive_name(cwd if os.path.isdir(cwd) else os.getcwd())
         ev['host'] = socket.gethostname()
     apply_event(conn, ev)
+    if ev['event'] == 'start':
+        row = find_harness_session(conn, ev['inst'], ev['harness'], ev['hsid'])
+        if row is not None:
+            with transaction(conn):
+                text = start_context(conn, row[0], row[1])
+                if text:
+                    emit(args, 'SessionStart', text)
+
+
+def emit(args, event, text):
+    """Hook output that adds text to the model's context: hookSpecificOutput JSON for Claude
+    Code and codex, plain text for pi or with --format text."""
+    if getattr(args, 'format', None) == 'text' or args.harness == 'pi':
+        sys.stdout.write(text + '\n')
+    else:
+        sys.stdout.write(json.dumps({'hookSpecificOutput': {'hookEventName': event,
+                                                            'additionalContext': text}}) + '\n')
+    sys.stdout.flush()
+
+
+def start_context(conn, token, name):
+    """Inside a write transaction: what a new session should know about the board.
+
+    Its name, and tickets of its repository whose holder ended or went idle, which it may
+    take over with kb claim --take. The prompt hints follow at the first prompt.
+    """
+    lines = ['kb: this session is `%s` on the shared board (`kb board`); requests and'
+             ' replies for it follow at its prompts.' % name]
+    repo = conn.execute('SELECT worktree FROM session WHERE token=?', (token,)).fetchone()
+    repo = repo_name(repo[0]) if repo and repo[0] and not GUEST else ''
+    if repo:
+        for tid, title in conn.execute(
+                "SELECT id, title FROM ticket WHERE repo=? AND status IN ('doing', 'blocked')"
+                ' AND assignee<>? ORDER BY id', (repo, token)).fetchall():
+            why = holder_gone(conn, tid)
+            if why:
+                lines.append('- #%d "%s" is held by a session that is %s: kb claim --take %d'
+                             ' to continue it' % (tid, hint_title(title), why, tid))
+    return '\n'.join(lines)
 
 
 def apply_event(conn, ev):
@@ -1378,16 +1866,35 @@ def hook_parser():
     p.add_argument('--id', help='harness session id (claude and codex: from stdin JSON)')
     p.add_argument('--cwd', help='session working directory')
     p.add_argument('--source', help='start source or end reason')
+    p.add_argument('--format', choices=('hook', 'text'), default='hook',
+                   help='hook: JSON for Claude Code and codex (default); text: plain')
     return p
 
 
 def hook_main(argv):
-    """kb hook: always exit 0; errors go to hook-errors.log. Only `prompt` (its hints) and
-    `guard` (its warning) print."""
+    """kb hook: always exit 0; errors go to hook-errors.log. Only `start` (board context),
+    `prompt` (its hints) and `guard` (its warning) print. KB=0 or BRAIN_SESSION_CONTEXT=0
+    turns the hooks off for automated runs; touching hook-debug.log beside the database logs
+    which hooks fire (event and payload keys, never prompt text)."""
     try:
         if os.environ.get('PI_SUBAGENT_DEPTH', '0').strip() not in ('', '0'):
             return EXIT_OK  # pi subagent child: its parent session is the one to record
-        run_hook(hook_parser().parse_args(argv))
+        if os.environ.get('KB') == '0' or os.environ.get('BRAIN_SESSION_CONTEXT') == '0':
+            return EXIT_OK
+        args = hook_parser().parse_args(argv)
+        debug = os.path.join(data_dir(), 'hook-debug.log')
+        if os.path.exists(debug) and args.event != 'guard':
+            raw = hook_input(args)
+            with contextlib.suppress(ValueError, OSError):
+                data = json.loads(raw) if raw.strip() else {}
+                with open(debug, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps({'t': now(), 'event': args.event, 'harness': args.harness,
+                                        'session': data.get('session_id'),
+                                        'keys': sorted(data) if isinstance(data, dict) else [],
+                                        'source': data.get('source') or data.get('reason')})
+                            + '\n')
+            sys.stdin = io.StringIO(raw)
+        run_hook(args)
     except SystemExit:  # --help
         pass
     except BaseException as e:  # noqa: B036 - a hook must never fail its harness
@@ -1411,13 +1918,18 @@ def cmd_board(args):
     conn = connect()
     stale_hours, cutoff = stale_cutoff()
     where, params = [], []
-    if not args.all:
+    if args.closed is not None:
+        since = fmt_time(datetime.datetime.now(datetime.timezone.utc)
+                         - datetime.timedelta(days=args.closed))
+        where.append("c.status IN ('done', 'abandoned') AND c.updated>=?")
+        params.append(since)
+    elif not args.all:
         where.append("c.status IN ('todo', 'doing', 'blocked')")
     if args.repo is not None:
         where.append('c.repo=?')
         params.append(args.repo)
-    if args.to is not None:
-        where.append('c.addressee=?')
+    if args.to is not None:  # requests to that name, and those any session may take
+        where.append("c.type='request' AND c.addressee IN (?, 'any')")
         params.append(args.to)
     if args.label is not None:
         where.append("instr(',' || c.labels || ',', ?) > 0")  # exact label, no wildcards
@@ -1451,6 +1963,26 @@ def cmd_board(args):
         ' LEFT JOIN session o ON o.token=c.opener'
         + (' WHERE ' + ' AND '.join(where) if where else '') + ' ORDER BY c.repo, c.id',
         params).fetchall()
+    # Parked ideas stay off the board; requests (questions, approvals) never count as parked.
+    hidden = 0
+    if not (args.all or args.to is not None or args.label == BACKLOG):
+        kept = [r for r in rows if r[1] == 'request' or BACKLOG not in r[9].split(',')]
+        hidden, rows = len(rows) - len(kept), kept
+    if args.json:
+        items = []
+        for (cid, ctype, title, crepo, status, assignee, claimed, activity, to, labels,
+             host, worktree, branch, target, ended, created, opener, replied, inst) in rows:
+            flags = board_flags(ctype, status, to, opener, replied, created, labels, activity,
+                                ended, cutoff, stale_hours, None)
+            items.append({'id': cid, 'type': ctype, 'status': status, 'title': title,
+                          'repo': crepo, 'labels': [l for l in labels.split(',') if l],
+                          'from': opener, 'to': to, 'assignee': assignee, 'created': created,
+                          'claimed_at': claimed, 'last_activity': activity, 'flags': flags})
+        json.dump(items, sys.stdout, ensure_ascii=False, indent=1)
+        print()
+        return
+    if not rows:
+        print('board empty' + (' for %s' % args.repo if args.repo is not None else ''))
     for status in STATUS_ORDER:
         group = [r for r in rows if r[4] == status]
         if not group:
@@ -1462,28 +1994,39 @@ def cmd_board(args):
             if crepo != repo:
                 repo = crepo
                 print('  [%s]' % (repo or 'cross-repo'))
-            flags = []
-            if to:
-                flags.append('to:' + to)
-            if ctype == 'request' and opener:
-                flags.append('from:' + opener)
-            if ctype == 'request' and replied and status in ('todo', 'doing', 'blocked'):
-                flags.append('answered')
-            if status == 'todo' and parse_time(created) < cutoff:
-                flags.append('waiting>%gh' % stale_hours)
-            flags += ['#' + l for l in labels.split(',') if l]
-            if status in OWNED:
-                if parse_time(activity) < cutoff:
-                    flags.append('idle>%gh' % stale_hours)
-                if ended:
-                    flags.append('session-ended')
-                hint = git_hint(host, worktree, branch, target, inst, here)
-                if hint:
-                    flags.append(hint)
+            flags = board_flags(ctype, status, to, opener, replied, created, labels, activity,
+                                ended, cutoff, stale_hours,
+                                git_hint(host, worktree, branch, target, inst, here)
+                                if status in OWNED else None)
             print('    #%-4d %-7s %s  @%s  %s  %s' % (
                 cid, ctype, title, assignee or '-',
                 age(claimed) if status in OWNED else age(created) if status == 'todo' else '-',
                 ' '.join(flags)))
+    if hidden:
+        print('(%d backlog ticket%s hidden: kb board --label backlog)'
+              % (hidden, '' if hidden == 1 else 's'))
+
+
+def board_flags(ctype, status, to, opener, replied, created, labels, activity, ended, cutoff,
+                stale_hours, hint):
+    flags = []
+    if to:
+        flags.append('to:' + to)
+    if ctype == 'request' and opener:
+        flags.append('from:' + opener)
+    if ctype == 'request' and replied and status in OPEN:
+        flags.append('answered')
+    if status == 'todo' and parse_time(created) < cutoff:
+        flags.append('waiting>%gh' % stale_hours)
+    flags += ['#' + l for l in labels.split(',') if l]
+    if status in OWNED:
+        if parse_time(activity) < cutoff:
+            flags.append('idle>%gh' % stale_hours)
+        if ended:
+            flags.append('session-ended')
+        if hint:
+            flags.append(hint)
+    return flags
 
 
 def cmd_show(args):
@@ -1587,14 +2130,34 @@ def cmd_whoami(args):
 
 
 def cmd_backup(args):
-    if inside_git_tree(args.path):
-        raise UsageError('backup path is inside a git working tree: %s' % args.path)
+    """A consistent copy of the board: to path, or kb-<time>.sqlite in --dir (default:
+    backups/ beside the database), keeping the newest --keep files there."""
+    if args.path is None:
+        folder = os.path.abspath(os.path.expanduser(args.dir or os.path.join(data_dir(),
+                                                                               'backups')))
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        path = os.path.join(folder, 'kb-%s.sqlite' % datetime.datetime.now(
+            datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ'))
+    else:
+        folder, path = None, os.path.abspath(os.path.expanduser(args.path))
+    if tracked_in_git(path):
+        raise UsageError('backup path is inside a git working tree: %s' % path)
     conn = connect()
-    dest = sqlite3.connect(args.path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    os.close(fd)
+    os.chmod(path, 0o600)
+    dest = sqlite3.connect(path)
     with dest:
         conn.backup(dest)
     dest.close()
-    print('backup written: %s' % args.path)
+    print('backup written: %s' % path)
+    if folder and args.keep:
+        old = sorted(f for f in os.listdir(folder)
+                     if f.startswith('kb-') and f.endswith('.sqlite'))[:-args.keep]
+        for f in old:
+            os.remove(os.path.join(folder, f))
+        if old:
+            print('removed %d old backup(s)' % len(old))
 
 
 def cmd_restore(args):
@@ -1679,7 +2242,7 @@ def fmt_time(dt):
 
 def connect_readonly():
     """Open the board read-only, without creating, migrating or writing anything."""
-    path = os.path.abspath(os.path.expanduser(os.environ.get('KB_DB') or DEFAULT_DB))
+    path = board_file()
     if not os.path.isfile(path):
         raise UsageError('no board database at %s' % path)
     try:
@@ -2847,7 +3410,7 @@ class Setup:
 
     @staticmethod
     def board_path():
-        return os.path.abspath(os.path.expanduser(os.environ.get('KB_DB') or DEFAULT_DB))
+        return board_file()
 
     def board_installation(self):
         """The id an existing board recorded, so a lost config does not split identities."""
@@ -3201,6 +3764,8 @@ def build_parser():
     p = Parser(prog='kb', description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--version', action=VersionAction,
                    help="show kb's release and, in a git checkout, its commit")
+    p.add_argument('--session', dest='global_session', metavar='TOKEN',
+                   help='session token from kb start (also accepted after the command)')
     sub = p.add_subparsers(dest='command', metavar='command')
     sub.required = True
 
@@ -3221,10 +3786,14 @@ def build_parser():
         s.set_defaults(func=func)
         return s
 
-    s = cmd('start', cmd_start, 'register this session and print its token', [where])
+    s = cmd('start', cmd_start, 'start a token session and print its token', [where])
     s.add_argument('--as', dest='name', required=True, help='session name, e.g. partflow')
-    s.add_argument('--harness', default='',
-                   help='claude, codex, pi, ...; picks the harness session id when several are set')
+    s.add_argument('--harness', default='', help='label for the session, e.g. cli or pi')
+    s.add_argument('--cwd', help='working directory the session works in (default: here)')
+    s = cmd('name', cmd_name, 'rename the calling session', [ident])
+    s.add_argument('name')
+    cmd('end', cmd_end, 'end a token session; its tickets stay held with a session-ended note',
+        [ident])
 
     s = cmd('add', cmd_add, 'add a task (claimed by you) or a request', [ident, where, text])
     s.add_argument('title')
@@ -3234,19 +3803,42 @@ def build_parser():
     s.add_argument('--label', action='append', default=[], help='e.g. needs-curator (repeatable)')
     s.add_argument('--merge-target', default='', help='branch the work merges into')
     s.add_argument('--new', action='store_true', help='add despite similar open tickets')
+    claim = s.add_mutually_exclusive_group()
+    claim.add_argument('--claim', action='store_true',
+                       help='task: claim it at once (default inside a harness session)')
+    claim.add_argument('--todo', action='store_true',
+                       help='task: leave it todo for any session (default with --session)')
+    s.add_argument('--note', help='first note text (else --stdin)')
 
-    cmd('claim', cmd_claim, 'claim a todo ticket', [ident, where], ticket=True)
+    s = cmd('claim', cmd_claim, 'claim a todo ticket', [ident, where], ticket=True)
+    s.add_argument('--take', action='store_true',
+                   help='take over a ticket whose holder ended or is idle (flags on the board)')
     cmd('block', cmd_block, 'doing -> blocked (assignee)', [ident, text], ticket=True)
     cmd('resume', cmd_resume, 'blocked -> doing (assignee)', [ident, text], ticket=True)
-    cmd('release', cmd_release, 'give a claim back to todo (assignee or curator)',
-        [ident, text], ticket=True)
-    s = cmd('close', cmd_close, 'close with the closing lines on stdin', [ident], ticket=True)
+    s = cmd('release', cmd_release, 'give a claim back to todo (assignee or curator)',
+            [ident, text], ticket=True)
+    s.add_argument('--why', help='handoff note: what is done, what is open')
+    s = cmd('close', cmd_close, 'close: --where/--changed/--open, --result, or lines on stdin',
+            [ident], ticket=True)
     s.add_argument('--force', action='store_true', help='curator: close a ticket owned by another')
+    s.add_argument('--where', help='task: deployed where')
+    s.add_argument('--changed', help='task: what changed')
+    s.add_argument('--open', help="task: what is still open ('nothing' if so)")
+    s.add_argument('--result', help='closing note in one line (requests)')
+    s.add_argument('--withdraw', action='store_true',
+                   help='request: drop it without a reply (abandoned)')
     cmd('abandon', cmd_abandon, 'todo -> abandoned (opener or curator)', [ident, text], ticket=True)
     cmd('reopen', cmd_reopen, 'done/abandoned -> todo (opener or curator)', [ident, text],
         ticket=True)
-    s = cmd('note', cmd_note, 'append a note from stdin', [ident], ticket=True)
+    s = cmd('note', cmd_note, 'append a note: text as arguments, or - / nothing for stdin',
+            [ident], ticket=True)
+    s.add_argument('text', nargs='*', help='note text; - or none reads stdin')
     s.add_argument('--kind', choices=('comment', 'request', 'reply'), default='comment')
+    s.add_argument('--reply', action='store_true', help='same as --kind reply')
+    s = cmd('label', cmd_label, 'add labels, or --remove them (backlog parks a task)', [ident],
+            ticket=True)
+    s.add_argument('labels', nargs='*')
+    s.add_argument('--remove', action='append', default=[], metavar='LABEL')
     cmd('touch', cmd_touch, 'record activity on your ticket', [ident], ticket=True)
     cmd('session-ended', cmd_session_ended, 'note session end on all your open tickets', [ident])
     sub.add_parser('hook', help='harness hook: kb hook start|stop|end --harness <h>',
@@ -3257,7 +3849,11 @@ def build_parser():
     s.add_argument('--mine', action='store_true', help='only tickets you hold or opened')
     s.add_argument('--to', help='only requests addressed to this name, e.g. curator')
     s.add_argument('--label', help='only tickets with this label, e.g. approval')
-    s.add_argument('--all', action='store_true', help='include done and abandoned')
+    s.add_argument('--all', action='store_true',
+                   help='include done, abandoned and backlog tickets')
+    s.add_argument('--closed', type=float, metavar='DAYS',
+                   help='only tickets closed in the last DAYS days')
+    s.add_argument('--json', action='store_true', help='one JSON list, for scripts')
     cmd('show', cmd_show, 'show a ticket and its notes', ticket=True)
     s = cmd('sessions', cmd_sessions, 'session names seen in the last %d days or holding a'
             ' ticket, last seen first (read-only)' % KNOWN_DAYS)
@@ -3265,7 +3861,9 @@ def build_parser():
     cmd('whoami', cmd_whoami, 'show the calling session, never its token (read-only)', [ident])
 
     s = cmd('backup', cmd_backup, 'write a consistent copy of the database')
-    s.add_argument('path')
+    s.add_argument('path', nargs='?', help='file to write (default: kb-<time>.sqlite in --dir)')
+    s.add_argument('--dir', help='backup folder (default: backups/ beside the database)')
+    s.add_argument('--keep', type=int, default=0, help='keep only the newest N backups in --dir')
     s = cmd('restore', cmd_restore, 'curator: restore a backup and block claims', [ident])
     s.add_argument('path')
     s = cmd('recover', cmd_recover, 'curator: lift the block after reconciling', [ident])
@@ -3293,6 +3891,8 @@ def build_parser():
 
 def run(args):
     """Run a parsed command; its exit code."""
+    if getattr(args, 'global_session', None) and not getattr(args, 'session', None):
+        args.session = args.global_session
     try:
         code = args.func(args)
     except KbError as e:
@@ -3301,7 +3901,57 @@ def run(args):
     except sqlite3.OperationalError as e:
         sys.stderr.write('kb: database error: %s\n' % e)
         return EXIT_REJECTED
+    finally:
+        if args.func not in (cmd_setup, cmd_spool):
+            notify()
     return EXIT_OK if code is None else code
+
+
+def notify():
+    """Run every executable in <db dir>/notify.d once when notes were added since the last run.
+
+    The push side: the writer itself starts the notifiers, so nothing has to watch the
+    database. notify.last beside the database records the newest note the hooks were started
+    for, so a kb process that died between its commit and this call is caught up by the next
+    command. Hooks run detached with KB_DB, KB_FIRST_NOTE and KB_LAST_NOTE set; they never
+    block or fail the kb command.
+    """
+    folder = os.path.join(data_dir(), 'notify.d')
+    if not os.path.isdir(folder):
+        return
+    try:
+        conn = sqlite3.connect('file:%s?mode=ro' % urllib.parse.quote(board_file()), uri=True)
+        try:
+            after = conn.execute('SELECT coalesce(max(id), 0) FROM note').fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return
+    mark = os.path.join(data_dir(), 'notify.last')
+    try:
+        with open(mark) as f:
+            before = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        with contextlib.suppress(OSError):
+            with open(mark, 'w') as f:  # first run: start from now
+                f.write('%d\n' % after)
+        return
+    if after <= before:
+        return
+    with contextlib.suppress(OSError):
+        with open(mark, 'w') as f:
+            f.write('%d\n' % after)
+    hook_env = dict(os.environ, KB_DB=board_file(), KB_FIRST_NOTE=str(before + 1),
+                    KB_LAST_NOTE=str(after))
+    for name in sorted(os.listdir(folder)):
+        path = os.path.join(folder, name)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            try:
+                subprocess.Popen([path], env=hook_env, start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except OSError as e:
+                sys.stderr.write('kb: notify hook %s failed to start: %s\n' % (name, e))
 
 
 def main(argv=None):

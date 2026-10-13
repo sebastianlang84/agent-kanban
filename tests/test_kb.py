@@ -17,6 +17,13 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KB = os.path.join(REPO, 'kb')
 
 # The atomic claim in kb, and a read-then-write replacement used for the mutation check.
+def context(out):
+    """The text a hook adds to the model's context: hookSpecificOutput JSON or plain text."""
+    if out.startswith('{'):
+        return json.loads(out)['hookSpecificOutput']['additionalContext'] + '\n'
+    return out
+
+
 CLAIM_ORIGINAL = """\
     with transaction(conn):
         if recovering(conn):
@@ -40,8 +47,10 @@ class KbCase(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items()
                     if k not in ('KB_SESSION', 'KB_TEST_BARRIER', 'KB_STALE_HOURS',
                                  'CLAUDE_CODE_SESSION_ID', 'CODEX_SESSION_ID', 'PI_SESSION_ID',
+                                 'CODEX_THREAD_ID', 'KB_HARNESS', 'KB', 'BRAIN_SESSION_CONTEXT',
                                  'PI_SUBAGENT_DEPTH')}
         self.env['KB_DB'] = self.db
+        self.env['KB_TEST_NO_PROC'] = '1'  # the suite may itself run inside an agent harness
         # kb reads and writes its config (installation id) under HOME / XDG_CONFIG_HOME.
         self.home = os.path.join(self.tmp, 'home')
         os.mkdir(self.home)
@@ -118,7 +127,7 @@ class RaceTest(KbCase):
 
     def run_race(self, kb):
         opener = self.start('opener')
-        ticket = self.ok('add', 'race target', '--type', 'request', '--to', 'any',
+        ticket = self.ok('add', '--claim', 'race target', '--type', 'request', '--to', 'any',
                        '--session', opener, kb=kb)
         tokens = [self.start('racer%d' % i) for i in range(self.N)]
         barrier = os.path.join(self.tmp, 'barrier')
@@ -156,7 +165,7 @@ class RaceTest(KbCase):
 
     def test_concurrent_notes_are_all_stored(self):
         tok = self.start('alice')
-        ticket = self.ok('add', 'noisy ticket', '--session', tok)
+        ticket = self.ok('add', '--claim', 'noisy ticket', '--session', tok)
         barrier = os.path.join(self.tmp, 'barrier')
         env = dict(self.env, KB_TEST_BARRIER=barrier)
         procs = []
@@ -180,10 +189,10 @@ class TransitionTest(KbCase):
         self.cur = self.start('curator')
 
     def task(self, title='some task', who=None):
-        return self.ok('add', title, '--new', '--session', who or self.alice)
+        return self.ok('add', '--claim', title, '--new', '--claim', '--session', who or self.alice)
 
     def request(self, to='bob', title='some request'):
-        return self.ok('add', title, '--new', '--type', 'request', '--to', to,
+        return self.ok('add', '--claim', title, '--new', '--type', 'request', '--to', to,
                        '--session', self.alice)
 
     def test_add_task_is_created_and_claimed_by_opener(self):
@@ -193,8 +202,8 @@ class TransitionTest(KbCase):
     def test_add_request_is_todo_and_addressed(self):
         c = self.request('bob')
         self.assertEqual(self.ticket(c), ('todo', None, self.alice, 'bob'))
-        self.assertEqual(self.code('add', 'x', '--type', 'request', '--session', self.alice), 3)
-        self.assertEqual(self.code('add', 'x', '--to', 'bob', '--session', self.alice), 3)
+        self.assertEqual(self.code('add', '--claim', 'x', '--type', 'request', '--session', self.alice), 3)
+        self.assertEqual(self.code('add', '--claim', 'x', '--to', 'bob', '--session', self.alice), 3)
 
     def test_claim_by_addressee_only(self):
         c = self.request('bob')
@@ -202,7 +211,8 @@ class TransitionTest(KbCase):
         self.assertEqual(self.code('claim', c, '--session', self.cur), 1)
         self.assertEqual(self.code('claim', c, '--session', self.bob), 0)
         self.assertEqual(self.ticket(c)[:2], ('doing', self.bob))
-        self.assertEqual(self.code('claim', c, '--session', self.bob), 1)
+        self.assertEqual(self.ok('claim', c, '--session', self.bob), 'ticket %s: already yours' % c)
+        self.assertEqual(self.code('claim', c, '--session', self.carol), 1)
 
     def test_claim_any_by_any_session(self):
         c = self.request('any')
@@ -263,7 +273,7 @@ class TransitionTest(KbCase):
         self.assertIn('only the addressee (bob) may claim', err('claim', c, '--session', self.carol))
         # A todo ticket that still has an assignee (for example after a restore) is rejected for
         # the assignee, not blamed on the addressee.
-        held = self.ok('add', '--type', 'request', '--to', 'bob', 'held', '--session', self.alice)
+        held = self.ok('add', '--claim', '--type', 'request', '--to', 'bob', 'held', '--session', self.alice)
         conn = sqlite3.connect(self.db)
         conn.execute('UPDATE ticket SET assignee=? WHERE id=?', (self.alice, int(held)))
         conn.commit()
@@ -339,11 +349,14 @@ class TransitionTest(KbCase):
 
     def test_notes_and_touch(self):
         c = self.task()
-        for kind in ('comment', 'request', 'reply'):
+        for kind in ('comment', 'request'):
             self.ok('note', c, '--kind', kind, '--session', self.bob, stdin=kind + ' text')
+        self.ok('note', c, 'positional', 'text', '--session', self.bob)
         self.assertEqual(self.notes(c)[-3:], [('comment', 'comment text'),
                                               ('request', 'request text'),
-                                              ('reply', 'reply text')])
+                                              ('comment', 'positional text')])
+        # a reply answers a request, never a task
+        self.assertEqual(self.code('note', c, '--reply', '--session', self.bob, stdin='x'), 1)
         self.assertEqual(self.code('note', 999, '--session', self.bob, stdin='x'), 1)
         self.assertEqual(self.code('touch', c, '--session', self.bob), 1)
         self.assertEqual(self.code('touch', c, '--session', self.alice), 0)
@@ -376,20 +389,20 @@ class TransitionTest(KbCase):
 class SimilarTitleTest(KbCase):
     def test_similar_title_needs_new(self):
         tok = self.start('alice')
-        first = self.ok('add', 'Fix login bug', '--repo', 'web', '--session', tok)
-        r = self.kb('add', 'Fix the login bugs', '--repo', 'web', '--session', tok)
+        first = self.ok('add', '--claim', 'Fix login bug', '--repo', 'web', '--session', tok)
+        r = self.kb('add', '--claim', 'Fix the login bugs', '--repo', 'web', '--session', tok)
         self.assertEqual(r.returncode, 2)
         self.assertIn('#%s ' % first, r.stdout)
         self.assertEqual(self.query('SELECT count(*) FROM ticket')[0][0], 1)
-        self.ok('add', 'Fix the login bugs', '--repo', 'web', '--new', '--session', tok)
-        self.ok('add', 'Fix login bug', '--repo', 'api', '--session', tok)  # other repo
-        self.ok('add', 'Write release notes', '--repo', 'web', '--session', tok)
+        self.ok('add', '--claim', 'Fix the login bugs', '--repo', 'web', '--new', '--session', tok)
+        self.ok('add', '--claim', 'Fix login bug', '--repo', 'api', '--session', tok)  # other repo
+        self.ok('add', '--claim', 'Write release notes', '--repo', 'web', '--session', tok)
 
     def test_closed_tickets_do_not_count(self):
         tok = self.start('alice')
-        c = self.ok('add', 'Fix login bug', '--repo', 'web', '--session', tok)
+        c = self.ok('add', '--claim', 'Fix login bug', '--repo', 'web', '--session', tok)
         self.ok('close', c, '--session', tok, stdin='done')
-        self.ok('add', 'Fix login bug', '--repo', 'web', '--session', tok)
+        self.ok('add', '--claim', 'Fix login bug', '--repo', 'web', '--session', tok)
 
 
 class BoardHintTest(KbCase):
@@ -410,7 +423,7 @@ class BoardHintTest(KbCase):
 
     def test_idle_flag(self):
         tok = self.start('alice')
-        c = self.ok('add', 'slow work', '--session', tok)
+        c = self.ok('add', '--claim', 'slow work', '--session', tok)
         self.assertNotIn('idle>', self.board_line(c))
         conn = sqlite3.connect(self.db)
         conn.execute("UPDATE ticket SET last_activity='2020-01-01T00:00:00Z' WHERE id=?", (c,))
@@ -424,7 +437,7 @@ class BoardHintTest(KbCase):
 
     def test_session_ended_flag(self):
         alice, bob = self.start('alice'), self.start('bob')
-        c = self.ok('add', 'left behind', '--session', alice)
+        c = self.ok('add', '--claim', 'left behind', '--session', alice)
         self.ok('session-ended', '--session', alice)
         self.assertEqual(self.notes(c)[-1][0], 'session-ended')
         self.assertIn('session-ended', self.board_line(c))
@@ -435,7 +448,7 @@ class BoardHintTest(KbCase):
     def test_worktree_gone(self):
         tok = self.start('alice')
         wt = self.make_repo('wt')
-        c = self.ok('add', 'in a worktree', '--session', tok, cwd=wt)
+        c = self.ok('add', '--claim', 'in a worktree', '--session', tok, cwd=wt)
         self.assertEqual(self.query('SELECT repo, worktree, branch FROM ticket WHERE id=?', c)[0],
                          ('wt', wt, 'main'))
         line = self.board_line(c)
@@ -449,14 +462,14 @@ class BoardHintTest(KbCase):
         wt = self.make_repo('repo')
         self.git(wt, 'checkout', '-q', '-b', 'feat')
         self.git(wt, 'commit', '-q', '--allow-empty', '-m', 'feature')
-        c = self.ok('add', 'feature work', '--merge-target', 'main', '--session', tok, cwd=wt)
+        c = self.ok('add', '--claim', 'feature work', '--merge-target', 'main', '--session', tok, cwd=wt)
         self.assertNotIn('merged', self.board_line(c))
         self.git(wt, 'branch', '-f', 'main', 'feat')
         self.assertIn('merged', self.board_line(c))
 
     def test_foreign_host_is_unknown(self):
         tok = self.start('alice')
-        c = self.ok('add', 'on windows', '--worktree', os.path.join(self.tmp, 'nowhere'),
+        c = self.ok('add', '--claim', 'on windows', '--worktree', os.path.join(self.tmp, 'nowhere'),
                     '--session', tok)
         self.assertIn('worktree-gone', self.board_line(c))
         conn = sqlite3.connect(self.db)
@@ -469,8 +482,8 @@ class BoardHintTest(KbCase):
 
     def test_board_filters(self):
         alice, bob = self.start('alice'), self.start('bob')
-        a = self.ok('add', 'alpha', '--repo', 'r1', '--session', alice)
-        b = self.ok('add', 'beta', '--repo', 'r2', '--session', bob)
+        a = self.ok('add', '--claim', 'alpha', '--repo', 'r1', '--session', alice)
+        b = self.ok('add', '--claim', 'beta', '--repo', 'r2', '--session', bob)
         self.ok('close', b, '--session', bob, stdin='done')
         self.assertIsNotNone(self.board_line(a))
         self.assertIsNone(self.board_line(b))
@@ -484,8 +497,8 @@ class BoardHintTest(KbCase):
 class ApprovalTest(KbCase):
     def test_approval_request_to_curator_is_listed_and_closed_by_opener(self):
         agent = self.start('llmstack')
-        other = self.ok('add', 'Unrelated work', '--repo', 'r', '--session', agent)
-        req = self.ok('add', '--type', 'request', '--to', 'curator', '--label', 'approval',
+        other = self.ok('add', '--claim', 'Unrelated work', '--repo', 'r', '--session', agent)
+        req = self.ok('add', '--claim', '--type', 'request', '--to', 'curator', '--label', 'approval',
                       '--stdin', 'Commit PLAN.md D9', '--session', agent,
                       stdin='git commit -o PLAN.md\n')
         out = self.ok('board', '--to', 'curator')
@@ -497,14 +510,19 @@ class ApprovalTest(KbCase):
         self.assertRegex(line, r'  \d+m  ')  # waiting age for a todo request
         self.assertIsNone(self.board_line(other, '--label', 'approval'))
         self.assertEqual(self.code('close', req, '--session', agent, stdin='done\n'), 1)
-        self.ok('note', '--kind', 'reply', req, '--session', agent, stdin='curator: approved\n')
+        # The opener cannot record the approval itself; the curator claims and replies.
+        self.assertEqual(self.code('note', '--kind', 'reply', req, '--session', agent,
+                                   stdin='approved\n'), 1)
+        cur = self.start('curator')
+        self.ok('claim', req, '--session', cur)
+        self.ok('note', '--kind', 'reply', req, '--session', cur, stdin='approved\n')
         self.assertIn('answered', self.board_line(req, '--to', 'curator'))
         self.ok('close', req, '--session', agent, stdin='committed\n')
         self.assertEqual(self.ticket(req)[0], "done")
 
     def test_waiting_flag_after_stale_hours(self):
         agent = self.start('llmstack')
-        req = self.ok('add', '--type', 'request', '--to', 'curator', 'Merge x', '--session', agent)
+        req = self.ok('add', '--claim', '--type', 'request', '--to', 'curator', 'Merge x', '--session', agent)
         conn = sqlite3.connect(self.db)
         conn.execute("UPDATE ticket SET created='2020-01-01T00:00:00Z' WHERE id=?", (req,))
         conn.commit()
@@ -513,9 +531,9 @@ class ApprovalTest(KbCase):
 
     def test_label_filter_matches_whole_labels_only(self):
         agent = self.start('a')
-        t = self.ok('add', 'x', '--repo', 'r', '--label', 'approvals', '--session', agent)
+        t = self.ok('add', '--claim', 'x', '--repo', 'r', '--label', 'approvals', '--session', agent)
         self.assertIsNone(self.board_line(t, '--label', 'approval'))
-        u = self.ok('add', 'y', '--repo', 'r', '--label', 'aXb', '--session', agent)
+        u = self.ok('add', '--claim', 'y', '--repo', 'r', '--label', 'aXb', '--session', agent)
         self.assertIsNone(self.board_line(u, '--label', 'a_b'))
         self.assertIsNone(self.board_line(u, '--label', 'a%'))
         self.assertIsNotNone(self.board_line(u, '--label', 'aXb'))
@@ -525,22 +543,22 @@ class IdentityTest(KbCase):
     def test_same_name_sessions_are_told_apart(self):
         a = self.ok('start', '--as', 'llmstack', '--harness', 'claude')
         b = self.ok('start', '--as', 'llmstack', '--harness', 'claude')
-        ticket = self.ok('add', '--session', a, '--repo', 'r', 'Some task')
+        ticket = self.ok('add', '--claim', '--session', a, '--repo', 'r', 'Some task')
         label = self.board_line(ticket).split('@')[1].split()[0]
         self.assertRegex(label, r'^llmstack/claude\u00b7[0-9a-f]{4}$')
         self.assertNotIn(a, self.ok('board') + self.ok('show', ticket))
         r = self.kb('claim', '--session', b, ticket)
         self.assertEqual(r.returncode, 1)
         self.assertIn('held by ' + label, r.stderr)
-        other = self.ok('add', '--session', b, '--repo', 'r', '--new', 'Some task')
+        other = self.ok('add', '--claim', '--session', b, '--repo', 'r', '--new', 'Some task')
         self.assertNotEqual(label, self.board_line(other).split('@')[1].split()[0])
 
     def test_missing_or_invalid_token(self):
         tok = self.start('alice')
-        c = self.ok('add', 'x', '--session', tok)
+        c = self.ok('add', '--claim', 'x', '--session', tok)
         self.assertEqual(self.code('touch', c), 3)
         self.assertEqual(self.code('touch', c, '--session', 'deadbeefdeadbeef'), 3)
-        self.assertEqual(self.code('add', 'y', '--session', 'nope'), 3)
+        self.assertEqual(self.code('add', '--claim', 'y', '--session', 'nope'), 3)
         self.assertEqual(self.code('close', c, '--session', 'nope', stdin='x'), 3)
         self.assertEqual(self.code('touch', c, env=dict(self.env, KB_SESSION=tok)), 0)
 
@@ -548,7 +566,7 @@ class IdentityTest(KbCase):
         for name in ('any', '', 'two words'):
             self.assertEqual(self.code('start', '--as', name), 3)
         tok = self.start('alice')
-        self.assertRegex(tok, r'^[0-9a-f]{16}$')
+        self.assertRegex(tok, r'^[0-9a-f]{32}$')
         self.assertNotEqual(tok, self.start('alice'))
 
     def test_usage_error_exit_code(self):
@@ -567,19 +585,19 @@ class IdentityTest(KbCase):
 
     def test_schema_version(self):
         self.start('alice')
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 5)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 6)
         self.assertEqual(self.query('PRAGMA journal_mode')[0][0], 'wal')
 
 
 class BackupRestoreTest(KbCase):
     def test_restore_blocks_claims_until_recovered(self):
         alice, cur = self.start('alice'), self.start('curator')
-        held = self.ok('add', 'in progress', '--session', alice)
-        req = self.ok('add', 'open request', '--type', 'request', '--to', 'any',
+        held = self.ok('add', '--claim', 'in progress', '--session', alice)
+        req = self.ok('add', '--claim', 'open request', '--type', 'request', '--to', 'any',
                       '--session', alice)
         backup = os.path.join(self.tmp, 'backup.sqlite')
         self.ok('backup', backup)
-        later = self.ok('add', 'added after backup', '--session', alice)
+        later = self.ok('add', '--claim', 'added after backup', '--session', alice)
         bob = self.start('bob')  # a session that exists only after the backup
 
         self.assertEqual(self.code('restore', backup, '--session', alice), 1)
@@ -588,7 +606,7 @@ class BackupRestoreTest(KbCase):
         self.assertEqual(self.query('SELECT count(*) FROM ticket WHERE id=?', later)[0][0], 0)
 
         self.assertEqual(self.code('claim', req, '--session', bob), 1)
-        self.assertEqual(self.code('add', 'new work', '--session', bob), 1)
+        self.assertEqual(self.code('add', '--claim', 'new work', '--session', bob), 1)
         self.assertEqual(self.code('recover', '--done', '--session', alice), 1)
         self.assertEqual(self.code('recover', '--done', '--session', cur), 0)
         self.assertEqual(self.code('claim', req, '--session', bob), 0)
@@ -684,7 +702,7 @@ class MigrationTest(KbCase):
         make_v1(self.db)
         before = [self.query('SELECT * FROM %s ORDER BY 1' % t) for t in ('session', 'card', 'note')]
         self.assertIn('old work', self.ok('board'))
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 5)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 6)
         self.assertEqual(self.query('SELECT token, name, harness, host, worktree, started'
                                     ' FROM session'), before[0])
         self.assertEqual(self.query('SELECT harness_session, last_seen FROM session'),
@@ -700,7 +718,7 @@ class MigrationTest(KbCase):
         tables = ('session', 'card', 'note', 'session_event', 'meta', 'sqlite_sequence')
         before = [self.query('SELECT * FROM %s ORDER BY 1' % t) for t in tables]
         self.assertIn('old work', self.ok('board', '--all'))
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 5)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 6)
         after = [self.query('SELECT * FROM %s ORDER BY 1' % t)
                  for t in ('session', 'ticket', 'note', 'session_event', 'meta', 'sqlite_sequence')]
         # v5 appends installation to session and installation, event_id, received to events.
@@ -746,7 +764,7 @@ class MigrationTest(KbCase):
         make_v2(backup)
         cur = self.start('curator')
         self.assertIn('reconcile #1 ', self.ok('restore', backup, '--session', cur))
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 5)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 6)
         self.assertEqual(self.notes(1), [('comment', 'hello'), ('reply', 'second')])
 
     def test_restore_accepts_v1_backup(self):
@@ -755,7 +773,7 @@ class MigrationTest(KbCase):
         cur = self.start('curator')
         self.ok('hook', 'start', '--harness', 'pi', '--id', 'live-pi', '--cwd', self.tmp)
         self.assertIn('reconcile #1 ', self.ok('restore', backup, '--session', cur))
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 5)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 6)
         names = sorted(r[0] for r in self.query('SELECT name FROM session'))
         self.assertEqual(names, sorted(['curator', 'nightshift', os.path.basename(self.tmp)]))
         self.assertEqual(self.query('SELECT harness_session, event FROM session_event'),
@@ -771,7 +789,7 @@ class HarnessIdentityTest(KbCase):
 
     def test_harness_id_outranks_inherited_kb_session(self):
         parent = self.start('parent')
-        ticket = self.ok('add', 'child work', '--repo', 'r',
+        ticket = self.ok('add', '--claim', 'child work', '--repo', 'r',
                        env=self.henv(KB_SESSION=parent, PI_SESSION_ID='pi-9'))
         opener = self.query('SELECT opener FROM ticket WHERE id=?', ticket)[0][0]
         self.assertNotEqual(opener, parent)
@@ -786,7 +804,7 @@ class HarnessIdentityTest(KbCase):
 
     def test_env_id_auto_registers_once(self):
         env = self.henv(CLAUDE_CODE_SESSION_ID='cc-1')
-        ticket = self.ok('add', 'env work', env=env)
+        ticket = self.ok('add', '--claim', 'env work', env=env)
         rows = self.sessions()
         self.assertEqual(len(rows), 1)
         token, name, harness, hsid = rows[0]
@@ -802,7 +820,7 @@ class HarnessIdentityTest(KbCase):
         repo = os.path.join(self.tmp, 'myrepo')
         os.makedirs(os.path.join(repo, 'sub'))
         subprocess.run(['git', 'init', '-q', repo], check=True)
-        self.ok('add', 'x', '--repo', 'r', env=self.henv(PI_SESSION_ID='pi-1'),
+        self.ok('add', '--claim', 'x', '--repo', 'r', env=self.henv(PI_SESSION_ID='pi-1'),
                 cwd=os.path.join(repo, 'sub'))
         self.assertEqual(self.query('SELECT name, harness, worktree FROM session'),
                          [('myrepo', 'pi', repo)])
@@ -814,53 +832,57 @@ class HarnessIdentityTest(KbCase):
         subprocess.run(['git', '-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t',
                         'commit', '-q', '--allow-empty', '-m', 'init'], check=True)
         subprocess.run(['git', '-C', repo, 'worktree', 'add', '-q', '-b', 'w', wt], check=True)
-        ticket = self.ok('add', 'Task in worktree', env=self.henv(PI_SESSION_ID='pi-1'), cwd=wt)
+        ticket = self.ok('add', '--claim', 'Task in worktree', env=self.henv(PI_SESSION_ID='pi-1'), cwd=wt)
         self.assertEqual(self.query('SELECT name, worktree FROM session'), [('myrepo', wt)])
         self.assertEqual(self.query('SELECT repo FROM ticket WHERE id=?', ticket), [('myrepo',)])
 
     def test_curator_is_never_derived_from_a_directory(self):
         d = os.path.join(self.tmp, 'curator')
         os.mkdir(d)
-        self.ok('add', 'x', '--repo', 'r', env=self.henv(PI_SESSION_ID='pi-1'), cwd=d)
+        self.ok('add', '--claim', 'x', '--repo', 'r', env=self.henv(PI_SESSION_ID='pi-1'), cwd=d)
         self.assertEqual(self.query('SELECT name FROM session'), [('curator-session',)])
 
     def test_explicit_token_wins_over_env_id(self):
         tok = self.start('alice')
-        ticket = self.ok('add', 'x', '--session', tok, env=self.henv(CLAUDE_CODE_SESSION_ID='c'))
+        ticket = self.ok('add', '--claim', 'x', '--session', tok, env=self.henv(CLAUDE_CODE_SESSION_ID='c'))
         self.assertEqual(self.ticket(ticket)[1], tok)
         self.assertEqual(len(self.sessions()), 1)
-        ticket2 = self.ok('add', 'y', env=self.henv(KB_SESSION=tok))  # no harness id
+        ticket2 = self.ok('add', '--claim', 'y', env=self.henv(KB_SESSION=tok))  # no harness id
         self.assertEqual(self.ticket(ticket2)[1], tok)
 
     def test_several_env_ids_need_harness(self):
         env = self.henv(CLAUDE_CODE_SESSION_ID='c-1', PI_SESSION_ID='p-1')
-        r = self.kb('add', 'nested', env=env)
+        r = self.kb('add', '--claim', 'nested', env=env)
         self.assertEqual(r.returncode, 3)
         self.assertIn('--harness', r.stderr)
         self.assertEqual(self.sessions(), [])
-        ticket = self.ok('add', 'nested', '--harness', 'pi', env=env)
+        ticket = self.ok('add', '--claim', 'nested', '--harness', 'pi', env=env)
         self.assertEqual([r[2:] for r in self.sessions()], [('pi', 'p-1')])
         self.assertEqual(self.ticket(ticket)[1], self.sessions()[0][0])
         self.assertEqual(self.code('touch', ticket, '--harness', 'pi', env=env), 0)
         self.assertEqual(self.code('touch', ticket, '--harness', 'claude', env=env), 1)
         self.assertEqual(self.code('touch', ticket, '--harness', 'codex', env=env), 3)
 
-    def test_start_names_the_env_session(self):
+    def test_name_renames_the_env_session_and_start_makes_a_token_session(self):
         env = self.henv(CLAUDE_CODE_SESSION_ID='cc-9')
-        ticket = self.ok('add', 'x', '--repo', 'r', env=env)
-        tok = self.ok('start', '--as', 'partflow', env=env)
-        self.assertEqual(self.sessions(), [(tok, 'partflow', 'claude', 'cc-9')])
-        self.assertEqual(self.ticket(ticket)[1], tok)
-        self.assertEqual(self.ok('start', '--as', 'llmstack', env=env), tok)
+        ticket = self.ok('add', '--claim', 'x', '--repo', 'r', env=env)
+        hsess = self.sessions()[0][0]
+        self.ok('name', 'partflow', env=env)
+        self.assertEqual(self.sessions(), [(hsess, 'partflow', 'claude', 'cc-9')])
+        self.assertEqual(self.ticket(ticket)[1], hsess)
+        # kb start inside a harness starts a separate token session (scripts, ssh callers)
+        tok = self.ok('start', '--as', 'script', env=env)
+        self.assertNotEqual(tok, hsess)
+        self.assertEqual(self.sessions()[-1], (tok, 'script', '', ''))
+        self.ok('name', 'llmstack', env=env)
         self.assertEqual(self.sessions()[0][1], 'llmstack')
-        fresh = self.ok('start', '--as', 'first', env=self.henv(CODEX_SESSION_ID='cx-1'))
-        self.assertEqual(self.sessions()[-1], (fresh, 'first', 'codex', 'cx-1'))
         both = self.henv(CLAUDE_CODE_SESSION_ID='cc-9', CODEX_SESSION_ID='cx-1')
-        self.assertEqual(self.code('start', '--as', 'x', env=both), 3)
-        self.assertEqual(self.ok('start', '--as', 'again', '--harness', 'codex', env=both), fresh)
+        self.assertEqual(self.code('name', 'x', env=both), 3)
+        self.ok('name', 'again', '--harness', 'codex', env=both)
+        self.assertEqual(self.sessions()[-1][1:], ('again', 'codex', 'cx-1'))
 
     def test_no_id_at_all_is_an_identity_error(self):
-        self.assertEqual(self.code('add', 'x'), 3)
+        self.assertEqual(self.code('add', '--claim', 'x'), 3)
         self.assertEqual(self.sessions(), [])
 
 
@@ -868,7 +890,10 @@ class HookTest(KbCase):
     def hook(self, *args, stdin='', env=None):
         r = self.kb('hook', *args, stdin=stdin, env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout, '')
+        if args[0] == 'start':  # the start hook names the session and the takeover candidates
+            self.assertNotIn('Traceback', r.stdout)
+        else:
+            self.assertEqual(r.stdout, '')
         return r
 
     def events(self):
@@ -888,7 +913,7 @@ class HookTest(KbCase):
 
     def test_resume_after_end_clears_session_ended(self):
         env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
-        ticket = self.ok('add', 'long task', '--repo', 'r', env=env)
+        ticket = self.ok('add', '--claim', 'long task', '--repo', 'r', env=env)
         self.hook('end', '--harness', 'claude', stdin=self.claude('SessionEnd', reason='other'))
         self.assertIn('session-ended', self.board_line(ticket))
         time.sleep(1.1)  # event times have one-second resolution
@@ -898,7 +923,7 @@ class HookTest(KbCase):
 
     def test_end_then_start_in_one_second_clears_session_ended(self):
         env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
-        ticket = self.ok('add', 'cleared task', '--repo', 'r', env=env)
+        ticket = self.ok('add', '--claim', 'cleared task', '--repo', 'r', env=env)
         for _ in range(5):  # Claude's /clear: end, then start, usually in one second
             while time.time() % 1 > 0.3:
                 time.sleep(0.05)
@@ -918,10 +943,10 @@ class HookTest(KbCase):
                                                                      source='startup'))
         token, name = self.query('SELECT token, name FROM session')[0]
         self.assertEqual(name, os.path.basename(self.tmp))
-        ticket = self.ok('add', 'hooked', '--repo', 'r',
+        ticket = self.ok('add', '--claim', 'hooked', '--repo', 'r',
                        env=dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1'))
         self.assertEqual(self.ticket(ticket)[1], token)
-        self.ok('start', '--as', 'renamed', env=dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1'))
+        self.ok('name', 'renamed', env=dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1'))
         self.hook('start', '--harness', 'claude', stdin=self.claude('SessionStart',
                                                                      source='resume'))
         self.assertEqual(self.query('SELECT name FROM session'), [('renamed',)])  # no rename
@@ -1021,7 +1046,7 @@ class HookTest(KbCase):
         self.hook('start', '--harness', 'claude', stdin=self.claude('SessionStart'))
         env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
         for i in range(5):
-            self.ok('add', 'ticket %d' % i, '--new', env=env)
+            self.ok('add', '--claim', 'ticket %d' % i, '--new', env=env)
         del tok
         t0 = time.monotonic()
         self.hook('end', '--harness', 'claude', stdin=self.claude('SessionEnd', reason='exit'))
@@ -1108,7 +1133,7 @@ class GuardHookTest(KbCase):
     def test_silent_with_a_held_ticket_warns_without(self):
         self.register()
         env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
-        tid = self.ok('add', 'guarded work', '--repo', 'r', env=env)
+        tid = self.ok('add', '--claim', 'guarded work', '--repo', 'r', env=env)
         self.assertEqual(self.guard('git push'), '')
         self.ok('block', tid, '--session', self.ticket(tid)[1], stdin='waiting')
         self.assertEqual(self.guard('git push'), '')  # blocked counts as held
@@ -1156,7 +1181,7 @@ class PromptHintTest(KbCase):
         r = self.kb('hook', 'prompt', '--harness', harness, stdin=payload)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stderr, '')
-        return r.stdout
+        return context(r.stdout)
 
     def setUp(self):
         super().setUp()
@@ -1166,7 +1191,7 @@ class PromptHintTest(KbCase):
         self.other = self.start('beta')
 
     def test_request_to_name_shown_once_per_name(self):
-        tid = self.ok('add', '--type', 'request', '--to', 'alpha', 'check X', '--stdin',
+        tid = self.ok('add', '--claim', '--type', 'request', '--to', 'alpha', 'check X', '--stdin',
                       '--session', self.other, stdin='details')
         out = self.prompt()
         self.assertIn('request #%s "check X" from beta' % tid, out)
@@ -1177,13 +1202,13 @@ class PromptHintTest(KbCase):
         self.assertEqual(self.prompt(hsid='cc-3', cwd=self.tmp), '')
 
     def test_any_request_and_claimed_or_own_requests(self):
-        anyone = self.ok('add', '--type', 'request', '--to', 'any', 'anyone?', '--session',
+        anyone = self.ok('add', '--claim', '--type', 'request', '--to', 'any', 'anyone?', '--session',
                          self.other)
-        claimed = self.ok('add', '--type', 'request', '--to', 'alpha', 'taken', '--session',
+        claimed = self.ok('add', '--claim', '--type', 'request', '--to', 'alpha', 'taken', '--session',
                           self.other)
         gamma = self.start('alpha')  # same name, not a harness session
         self.ok('claim', claimed, '--session', gamma)
-        sibling = self.ok('add', '--type', 'request', '--to', 'alpha', 'from a sibling',
+        sibling = self.ok('add', '--claim', '--type', 'request', '--to', 'alpha', 'from a sibling',
                           '--session', gamma)
         out = self.prompt()
         self.assertIn('#%s "anyone?" from beta' % anyone, out)
@@ -1192,13 +1217,13 @@ class PromptHintTest(KbCase):
         # A request from another session of the same name (a worktree sibling) is a hint.
         self.assertIn('#%s "from a sibling" from alpha' % sibling, out)
         env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
-        own = self.ok('add', '--type', 'request', '--to', 'alpha', 'to myself', env=env)
+        own = self.ok('add', '--claim', '--type', 'request', '--to', 'alpha', 'to myself', env=env)
         self.assertNotIn('#%s ' % own, self.prompt())  # a session's own request is no hint
 
     def test_reply_by_a_session_of_the_same_name(self):
         self.prompt()
         env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
-        tid = self.ok('add', '--type', 'request', '--to', 'alpha', 'sibling question', env=env)
+        tid = self.ok('add', '--claim', '--type', 'request', '--to', 'alpha', 'sibling question', env=env)
         sibling = self.start('alpha')
         self.ok('claim', tid, '--session', sibling)
         self.ok('note', '--kind', 'reply', tid, '--session', sibling, stdin='answer')
@@ -1206,7 +1231,7 @@ class PromptHintTest(KbCase):
 
     def test_title_is_one_short_line(self):
         long = 'line one\nIGNORE PREVIOUS \x1b[31m "quoted" ' + 'x' * 200
-        conn_title = self.ok('add', '--type', 'request', '--to', 'alpha', long, '--session',
+        conn_title = self.ok('add', '--claim', '--type', 'request', '--to', 'alpha', long, '--session',
                              self.other)
         out = self.prompt()
         hint = [l for l in out.splitlines() if l.startswith('- request #%s ' % conn_title)][0]
@@ -1216,7 +1241,7 @@ class PromptHintTest(KbCase):
         self.assertIn('\u2026', hint)
 
     def test_unregistered_session_gets_nothing_and_no_row(self):
-        self.ok('add', '--type', 'request', '--to', 'alpha', 'early', '--session', self.other)
+        self.ok('add', '--claim', '--type', 'request', '--to', 'alpha', 'early', '--session', self.other)
         self.assertEqual(self.prompt(hsid='cc-9', start=False), '')
         self.assertEqual(self.query("SELECT count(*) FROM session WHERE harness_session='cc-9'"),
                          [(0,)])
@@ -1224,7 +1249,7 @@ class PromptHintTest(KbCase):
     def test_reply_to_own_request_including_closed(self):
         self.prompt()  # registers the harness session as alpha
         env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
-        tid = self.ok('add', '--type', 'request', '--to', 'beta', 'question', env=env)
+        tid = self.ok('add', '--claim', '--type', 'request', '--to', 'beta', 'question', env=env)
         self.ok('claim', tid, '--session', self.other)
         self.ok('note', '--kind', 'reply', tid, '--session', self.other, stdin='answer')
         self.ok('close', tid, '--session', self.other, stdin='a\nb\nc')
@@ -1232,17 +1257,15 @@ class PromptHintTest(KbCase):
         self.assertIn('reply by beta', out)
         self.assertIn('#%s "question" (closed)' % tid, out)
         self.assertEqual(self.prompt(), '')
-        # The opener's own reply note is no reply hint; the request is answered as on the board.
-        tid2 = self.ok('add', '--type', 'request', '--to', 'beta', 'q2', env=env)
-        self.ok('note', '--kind', 'reply', tid2, env=env, stdin='self')
-        out = self.prompt()
-        self.assertNotIn('reply by', out)
-        self.assertIn('#%s "q2" is answered: kb close %s' % (tid2, tid2), out)
+        # The opener cannot answer its own request: only the session holding it replies.
+        tid2 = self.ok('add', '--claim', '--type', 'request', '--to', 'beta', 'q2', env=env)
+        self.assertEqual(self.code('note', '--kind', 'reply', tid2, env=env, stdin='self'), 1)
+        self.assertNotIn('reply by', self.prompt())
 
     def test_answered_request_reminds_the_opener_to_close(self):
         self.prompt()
         env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
-        tid = self.ok('add', '--type', 'request', '--to', 'beta', 'question', env=env)
+        tid = self.ok('add', '--claim', '--type', 'request', '--to', 'beta', 'question', env=env)
         self.ok('claim', tid, '--session', self.other)
         self.ok('note', '--kind', 'reply', tid, '--session', self.other, stdin='answer')
         out = self.prompt()
@@ -1258,7 +1281,7 @@ class PromptHintTest(KbCase):
     def test_close_once_per_request_with_several_replies(self):
         self.prompt()
         env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
-        tid = self.ok('add', '--type', 'request', '--to', 'beta', 'question', env=env)
+        tid = self.ok('add', '--claim', '--type', 'request', '--to', 'beta', 'question', env=env)
         self.ok('claim', tid, '--session', self.other)
         for i in range(2):
             self.ok('note', '--kind', 'reply', tid, '--session', self.other, stdin='a%d' % i)
@@ -1277,8 +1300,8 @@ class PromptHintTest(KbCase):
     def test_answered_before_hints_since_and_closed(self):
         self.prompt()
         env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
-        tid = self.ok('add', '--type', 'request', '--to', 'beta', 'old question', env=env)
-        done = self.ok('add', '--type', 'request', '--to', 'beta', 'settled', env=env)
+        tid = self.ok('add', '--claim', '--type', 'request', '--to', 'beta', 'old question', env=env)
+        done = self.ok('add', '--claim', '--type', 'request', '--to', 'beta', 'settled', env=env)
         for t in (tid, done):
             self.ok('claim', t, '--session', self.other)
             self.ok('note', '--kind', 'reply', t, '--session', self.other, stdin='answer')
@@ -1297,14 +1320,14 @@ class PromptHintTest(KbCase):
     def test_held_ticket_reminds_once_per_claim(self):
         self.prompt()
         env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
-        tid = self.ok('add', 'build it', env=env)  # a task is claimed by its opener
+        tid = self.ok('add', '--claim', 'build it', env=env)  # a task is claimed by its opener
         out = self.prompt()
         self.assertIn('- you hold #%s "build it" (doing): kb close %s when the work is done'
                       % (tid, tid), out)
         self.assertEqual(self.prompt(), '')
         # Another session's ticket is no hint, not even for the same name.
         sibling = self.start('alpha')
-        self.ok('add', 'not mine', '--session', sibling)
+        self.ok('add', '--claim', 'not mine', '--session', sibling)
         self.assertEqual(self.prompt(), '')
         # A new claim is a new event, also within the same second.
         self.ok('release', tid, env=env)
@@ -1319,7 +1342,7 @@ class PromptHintTest(KbCase):
         self.prompt()
         env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
         for i in range(6):
-            self.ok('add', 'job %d' % i, '--new', env=env)
+            self.ok('add', '--claim', 'job %d' % i, '--new', env=env)
         out = self.prompt()
         self.assertEqual(out.count('- you hold #'), 5)
         self.assertIn('1 more held tickets follow at the next prompt', out)
@@ -1336,7 +1359,7 @@ class PromptHintTest(KbCase):
     def test_idle_held_ticket_reminds_once_per_idle_episode(self):
         self.prompt()
         env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
-        tid = self.ok('add', 'build it', env=env)
+        tid = self.ok('add', '--claim', 'build it', env=env)
         self.assertIn('- you hold #%s ' % tid, self.prompt())
         self.assertEqual(self.prompt(), '')  # fresh: no idle reminder
         self.set_activity(tid, 3)
@@ -1353,21 +1376,21 @@ class PromptHintTest(KbCase):
         self.assertIn('- you hold #%s "build it" (doing), idle 2d: ' % tid, self.prompt())
         self.assertEqual(self.prompt(), '')
         # A ticket idle at its first hint gets the idle line only.
-        new = self.ok('add', 'started long ago', '--new', env=env)
+        new = self.ok('add', '--claim', 'started long ago', '--new', env=env)
         self.set_activity(new, 1)
         out = self.prompt()
         self.assertEqual(out.count('#%s ' % new), 1)
         self.assertIn('#%s "started long ago" (doing), idle ' % new, out)
         # Another session's idle ticket is no hint, not even for the same name.
         sibling = self.start('alpha')
-        other = self.ok('add', 'not mine', '--session', sibling)
+        other = self.ok('add', '--claim', 'not mine', '--session', sibling)
         self.set_activity(other, 3)
         self.assertEqual(self.prompt(), '')
 
     def test_idle_respects_stale_hours(self):
         self.prompt()
         env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
-        tid = self.ok('add', 'build it', env=env)
+        tid = self.ok('add', '--claim', 'build it', env=env)
         self.prompt()
         self.set_activity(tid, 1)
         self.env['KB_STALE_HOURS'] = '48'
@@ -1383,7 +1406,7 @@ class PromptHintTest(KbCase):
             self.assertIn('#%s "build it" (doing), idle ' % tid, self.prompt())
 
     def test_history_before_migration_is_not_hinted(self):
-        tid = self.ok('add', '--type', 'request', '--to', 'alpha', 'old', '--session', self.other)
+        tid = self.ok('add', '--claim', '--type', 'request', '--to', 'alpha', 'old', '--session', self.other)
         conn = sqlite3.connect(self.db)
         conn.execute("UPDATE meta SET value='2099-01-01T00:00:00Z' WHERE key='hints_since'")
         conn.commit()
@@ -1394,7 +1417,7 @@ class PromptHintTest(KbCase):
 
     def test_limit_summarises_the_rest(self):
         for i in range(7):
-            self.ok('add', '--type', 'request', '--to', 'alpha', 'task %d' % i, '--new',
+            self.ok('add', '--claim', '--type', 'request', '--to', 'alpha', 'task %d' % i, '--new',
                     '--session', self.other)
         out = self.prompt()
         self.assertEqual(out.count('- request #'), 5)
@@ -1737,8 +1760,8 @@ class SessionsTest(KbCase):
     def test_sessions_recent_all_harnesses_and_held(self):
         claude = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
         codex = dict(self.env, CODEX_SESSION_ID='cx-1')
-        held = self.ok('add', 'first task', '--repo', 'r', env=claude)
-        self.ok('add', 'another unrelated thing', '--repo', 'r', env=codex)
+        held = self.ok('add', '--claim', 'first task', '--repo', 'r', env=claude)
+        self.ok('add', '--claim', 'another unrelated thing', '--repo', 'r', env=codex)
         self.ok('block', held, env=claude)
         self.start('script')
         self.old_session('0123456789abcdef', 'ancient', 20)
@@ -1781,7 +1804,7 @@ class SessionsTest(KbCase):
         out = self.ok('whoami', env=env)
         self.assertIn('session: %s/claude (not registered yet)' % name, out)
         self.assertEqual(self.query('SELECT count(*) FROM session'), [(0,)])  # read-only
-        self.ok('add', 'some task', '--repo', 'r', env=env)
+        self.ok('add', '--claim', 'some task', '--repo', 'r', env=env)
         token = self.query('SELECT token FROM session')[0][0]
         out = self.ok('whoami', env=env)
         self.assertEqual(out.splitlines()[0], 'name: ' + name)
@@ -1808,7 +1831,7 @@ class SessionsTest(KbCase):
     def test_request_to_unknown_name_warns_and_is_added(self):
         me = self.start('alice')
         self.start('bob')
-        r = self.kb('add', 'question for kanban', '--type', 'request', '--to', 'kanban',
+        r = self.kb('add', '--claim', 'question for kanban', '--type', 'request', '--to', 'kanban',
                     '--session', me)
         self.assertEqual(r.returncode, 0, r.stderr)
         prefix = 'kb: no session currently has the name kanban; known names: '
@@ -1816,11 +1839,11 @@ class SessionsTest(KbCase):
         self.assertEqual(sorted(r.stderr[len(prefix):].strip().split(', ')), ['alice', 'bob'])
         self.assertEqual(self.ticket(r.stdout.strip())[3], 'kanban')
         for to in ('bob', 'any', 'curator'):
-            r = self.kb('add', 'question for kanban', '--type', 'request', '--to', to,
+            r = self.kb('add', '--claim', 'question for kanban', '--type', 'request', '--to', to,
                         '--new', '--session', me)
             self.assertEqual((r.returncode, r.stderr), (0, ''), to)
         # The similar-title check still exits 2 before any warning.
-        r = self.kb('add', 'question for kanban', '--type', 'request', '--to', 'kanban',
+        r = self.kb('add', '--claim', 'question for kanban', '--type', 'request', '--to', 'kanban',
                     '--session', me)
         self.assertEqual(r.returncode, 2)
         self.assertNotIn('no session currently has', r.stderr)

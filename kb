@@ -26,6 +26,10 @@ import tempfile
 import threading
 import time
 import urllib.parse
+try:
+    import fcntl  # not on Windows, where a guest never runs notify.d
+except ImportError:
+    fcntl = None
 
 VERSION = '0.3.0'  # release number (SemVer); bumped in the commit tagged vVERSION
 SCHEMA_VERSION = 6
@@ -641,6 +645,12 @@ def harness_ids():
     found = {}
     for h, v in HARNESS_ENV:
         value = (env(v) or '').strip()
+        if value and h in found and found[h] != value:
+            # e.g. an outer codex's CODEX_SESSION_ID inherited by a nested codex that sets
+            # CODEX_THREAD_ID: kb cannot tell which session is calling
+            raise UsageError('conflicting %s session ids in the environment (%s); pass'
+                             ' --session <token> from kb start' % (h, ', '.join(
+                                 n for k, n in HARNESS_ENV if k == h)))
         if value and h not in found:
             found[h] = value
     pi = (env('KB_SESSION') or '').strip()
@@ -763,16 +773,18 @@ def register(conn, harness, hsid, cwd):
 def curator_session(conn):
     """Token and name of the curator's session on this host, created on first use."""
     inst = host_installation(conn)
-    row = conn.execute('SELECT token, name FROM session WHERE name=? AND installation=?'
-                       ' ORDER BY started LIMIT 1', (CURATOR, inst)).fetchone()
+    query = ('SELECT token, name FROM session WHERE name=? AND installation=?'
+             ' ORDER BY started, rowid LIMIT 1')
+    row = conn.execute(query, (CURATOR, inst)).fetchone()
     if row is None:
-        t = now()
-        with transaction(conn):
-            token = secrets.token_hex(16)
-            conn.execute('INSERT INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-                         % SESSION_COLUMNS, (token, CURATOR, 'human', socket.gethostname(),
-                                             '', t, '', t, inst))
-        row = (token, CURATOR)
+        with transaction(conn):  # look again under the write lock: one curator session
+            row = conn.execute(query, (CURATOR, inst)).fetchone()
+            if row is None:
+                t = now()
+                row = (secrets.token_hex(16), CURATOR)
+                conn.execute('INSERT INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                             % SESSION_COLUMNS, (row[0], CURATOR, 'human',
+                                                 socket.gethostname(), '', t, '', t, inst))
     return tuple(row)
 
 
@@ -1214,14 +1226,16 @@ def cmd_close(args):
     text = closing_text(args, row[0] if row else 'task') if row else ''
     if row is not None and row[0] == 'request' and not text:
         text = 'closed'
-    # The curator closes another session's held ticket only on purpose: --force, or a plain
-    # close of a ticket nobody holds.
-    if row is not None and is_curator(name) and row[2] not in (None, me) and not args.force:
-        raise Rejected('close rejected: %s; the curator closes it with kb close --force'
-                       % describe(conn, args.id))
     with transaction(conn):
-        row = conn.execute('SELECT type FROM ticket WHERE id=?', (args.id,)).fetchone()
+        row = conn.execute('SELECT type, assignee FROM ticket WHERE id=?', (args.id,)).fetchone()
         require(conn, row is not None, args.id, 'close')
+        # The curator closes another session's held ticket only on purpose: --force, or a
+        # plain close of a ticket nobody holds (checked again by each UPDATE below).
+        if is_curator(name) and row[1] not in (None, me) and not args.force \
+                and row[0] == 'request' and conn.execute(
+                    'SELECT 1 FROM ticket WHERE id=? AND opener<>?', (args.id, me)).fetchone():
+            raise Rejected('close rejected: %s; the curator closes it with kb close --force'
+                           % describe(conn, args.id))
         if args.force:
             if not is_curator(name):
                 raise Rejected('close --force rejected: curator only')
@@ -1246,10 +1260,10 @@ def cmd_close(args):
             cur = conn.execute(
                 "UPDATE ticket SET status='done', updated=? WHERE id=?"
                 " AND status IN ('todo', 'doing', 'blocked')"
-                " AND (opener=? OR assignee=? OR ? OR (SELECT name FROM session"
-                "      WHERE token=ticket.opener)=?)"
+                " AND (opener=? OR assignee=? OR ? AND (assignee IS NULL OR assignee=?)"
+                "      OR (SELECT name FROM session WHERE token=ticket.opener)=?)"
                 " AND EXISTS (SELECT 1 FROM note WHERE ticket_id=ticket.id AND kind='reply')",
-                (t, args.id, me, me, is_curator(name), name))
+                (t, args.id, me, me, is_curator(name), me, name))
             kind = 'close'
             action = 'close request'
         require(conn, cur.rowcount == 1, args.id, action, me, name)
@@ -3929,7 +3943,10 @@ def run(args):
         return EXIT_REJECTED
     finally:
         if args.func not in (cmd_setup, cmd_spool):
-            notify()
+            try:
+                notify()
+            except Exception as e:  # noqa: BLE001 - the command itself already committed
+                sys.stderr.write('kb: notify failed: %s\n' % e)
     return EXIT_OK if code is None else code
 
 
@@ -3954,19 +3971,23 @@ def notify():
     except sqlite3.Error:
         return
     mark = os.path.join(data_dir(), 'notify.last')
+    # One writer at a time reads and advances the mark, so ranges neither overlap nor go back.
+    lock = open(mark + '.lock', 'a')
     try:
-        with open(mark) as f:
-            before = int(f.read().strip() or 0)
-    except (OSError, ValueError):
-        with contextlib.suppress(OSError):
-            with open(mark, 'w') as f:  # first run: start from now
+        if fcntl:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(mark) as f:
+                before = int(f.read().strip() or 0)
+        except (OSError, ValueError):
+            with open(mark, 'w') as f:  # first run: start from now, never replay history
                 f.write('%d\n' % after)
-        return
-    if after <= before:
-        return
-    with contextlib.suppress(OSError):
-        with open(mark, 'w') as f:
-            f.write('%d\n' % after)
+            return
+        if after <= before:
+            return
+        write_atomic(mark, '%d\n' % after)
+    finally:
+        lock.close()
     hook_env = dict(os.environ, KB_DB=board_file(), KB_FIRST_NOTE=str(before + 1),
                     KB_LAST_NOTE=str(after))
     for name in sorted(os.listdir(folder)):

@@ -93,6 +93,23 @@ class PortedTest(KbCase):
                                     ' ON t.assignee=s.token WHERE t.id=?', tid),
                          [('pi', 'p-7')])
 
+    def test_conflicting_codex_ids_are_refused(self):
+        env = dict(self.env, CODEX_SESSION_ID='outer', CODEX_THREAD_ID='inner')
+        r = self.kb('add', 'x', '--repo', 'r', env=env)
+        self.assertEqual(r.returncode, 3)
+        self.assertIn('conflicting codex session ids', r.stderr)
+        same = dict(self.env, CODEX_SESSION_ID='one', CODEX_THREAD_ID='one')
+        self.assertEqual(self.code('add', 'y', '--repo', 'r', env=same), 0)
+
+    def test_curator_close_of_a_held_request_needs_force(self):
+        cur = self.start('curator')
+        req = self.ok('add', 'q', '--type', 'request', '--to', 'bob', '--session', self.alice)
+        self.ok('claim', req, '--session', self.bob)
+        self.ok('note', req, '--reply', 'a', '--session', self.bob)
+        self.assertEqual(self.code('close', req, '--result', 'x', '--session', cur), 1)
+        self.ok('close', req, '--force', '--session', cur, stdin='forced')
+        self.assertEqual(self.ticket(req)[0], 'done')
+
     def test_no_identity_outside_a_terminal_is_refused(self):
         r = self.kb('board', '--mine')
         self.assertEqual(r.returncode, 3)

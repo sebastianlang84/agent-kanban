@@ -147,11 +147,30 @@ class ToolsCase(KbCase):
         path = TOOLS / 'kb-agent-concierge'
         tree = ast.parse(path.read_text(), filename=str(path))
         funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)
-                 and n.name in ('newest_own_note', 'ticket_state')]
-        self.assertEqual(len(funcs), 2)
+                 and n.name in ('newest_own_note', 'ticket_state', 'open_escalation')]
+        self.assertEqual(len(funcs), 3)
         namespace = dict(sqlite3=sqlite3, DB=self.db, ticket=str(ticket))
         exec(compile(ast.Module(body=funcs, type_ignores=[]), str(path), 'exec'), namespace)
         return namespace['newest_own_note'], namespace['ticket_state']
+
+    def test_concierge_finds_its_open_escalation(self):
+        path = TOOLS / 'kb-agent-concierge'
+        tree = ast.parse(path.read_text(), filename=str(path))
+        func = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'open_escalation']
+        namespace = dict(sqlite3=sqlite3, DB=self.db)
+        exec(compile(ast.Module(body=func, type_ignores=[]), str(path), 'exec'), namespace)
+        find = namespace['open_escalation']
+        title = 'concierge: kb #7 braucht dich'
+        self.assertEqual(find(title), 0)
+        self.add(title, owner=self.writer, to='curator')  # same title, other opener
+        self.assertEqual(find(title), 0)
+        self.add(title, owner=self.concierge, to='concierge')  # other addressee
+        self.assertEqual(find(title), 0)
+        mine = self.add(title, owner=self.concierge, to='curator')
+        self.add('concierge: kb #8 braucht dich', owner=self.concierge, to='curator')
+        self.assertEqual(find(title), mine)
+        self.ok('close', mine, '--withdraw', '--session', self.concierge)
+        self.assertEqual(find(title), 0)
 
     def test_concierge_reads_author_join_kind_and_ticket(self):
         ticket = self.add('concierge request', to='concierge')
@@ -178,6 +197,49 @@ class ToolsCase(KbCase):
         task = self.add('concierge owned task', owner=self.concierge)
         _, task_state = self.concierge_reads(task)
         self.assertEqual(task_state(), ('task', None, 'doing'))
+
+    def escalate(self, ticket, note, kb_bin=None):
+        # The real script, with HOME pointing at the test home: attempts are preset to the limit,
+        # so it escalates and exits before it would start Claude.
+        kb_link = Path(self.home) / 'dev/agent-kanban/kb'
+        kb_link.parent.mkdir(parents=True, exist_ok=True)
+        if kb_link.is_symlink() or kb_link.exists():
+            kb_link.unlink()
+        kb_link.symlink_to(kb_bin or (TOOLS.parent / 'kb'))
+        logs = Path(self.home) / '.agents/state/kb/agent-concierge'
+        logs.mkdir(parents=True, exist_ok=True)
+        import datetime
+        (logs / 'counts.json').write_text(json.dumps(
+            {'day': datetime.date.today().isoformat(), 'total': 0, 'tickets': {},
+             'attempts': {str(note): 3}}))
+        env = dict(self.env, KB_TICKET=str(ticket), KB_NOTE=str(note))
+        return subprocess.run([sys.executable, str(TOOLS / 'kb-agent-concierge')], env=env,
+                              cwd=self.tmp, capture_output=True, text=True, timeout=30)
+
+    def test_concierge_escalates_once_per_ticket(self):
+        first = self.escalate(133, 1)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self.escalate(133, 2)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        other = self.escalate(134, 3)
+        self.assertEqual(other.returncode, 0, other.stderr)
+        rows = self.query("SELECT id, title FROM ticket WHERE type='request' AND addressee='curator'"
+                          " ORDER BY id")
+        self.assertEqual([r[1] for r in rows], ['concierge: kb #133 braucht dich',
+                                                'concierge: kb #134 braucht dich'])
+        notes = self.query('SELECT text FROM note WHERE ticket_id=? ORDER BY id', rows[0][0])
+        self.assertEqual(len(notes), 2)
+        self.assertIn('Notiz 2', notes[1][0])
+        # A failed note keeps the trigger for a retry instead of counting it as handled.
+        stub = Path(self.tmp) / 'kb-note-fails'
+        stub.write_text('import os, sys\n'  # the script runs it as `python3 <kb> ...`
+                        'if sys.argv[1] == "note": sys.exit("locked")\n'
+                        'os.execvp("python3", ["python3", %r] + sys.argv[1:])\n'
+                        % str(TOOLS.parent / 'kb'))
+        failed = self.escalate(133, 4, kb_bin=stub)
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn('locked', failed.stderr)
+        self.assertEqual(len(self.query('SELECT id FROM note WHERE ticket_id=?', rows[0][0])), 2)
 
 
 if __name__ == '__main__':

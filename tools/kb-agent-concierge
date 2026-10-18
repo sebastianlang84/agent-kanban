@@ -9,7 +9,8 @@ tool allowlist in ~/.agents/concierge/permissions.json.
 Exit 0 means the note is done (answered, or deliberately skipped, or escalated to Sebastian);
 exit 1 keeps it for a retry. A run counts as done only if concierge left a trace for this ticket:
 a kb note newer than the trigger or a journal entry for the ticket. Limits: 25 turns, 20 minutes,
-3 attempts per note, 40 runs per day, 6 runs per ticket per day; beyond that it escalates.
+3 attempts per note, 40 runs per day, 6 runs per ticket per day; beyond that it escalates through one
+open curator request per ticket (later escalations become notes on it).
 Logs: ~/.agents/state/kb/agent-concierge/ (0700, 30 days).
 """
 import datetime, json, os, re, sqlite3, subprocess, sys, time
@@ -60,6 +61,16 @@ def ticket_state():
                             (int(ticket),)).fetchone()
 
 
+def open_escalation(title: str) -> int:
+    """Id of concierge's open curator request with this title, or 0."""
+    with sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10) as conn:
+        row = conn.execute("SELECT t.id FROM ticket t JOIN session s ON s.token=t.opener"
+                           " WHERE s.name='concierge' AND t.type='request' AND t.addressee='curator'"
+                           " AND t.title=? AND t.status IN ('todo', 'doing', 'blocked')"
+                           " ORDER BY t.id LIMIT 1", (title,)).fetchone()
+    return row[0] if row else 0
+
+
 def journal_mentions() -> int:
     return len(re.findall(rf"kb #{ticket}\b", JOURNAL.read_text())) if JOURNAL.exists() else 0
 
@@ -82,11 +93,19 @@ def save():
 
 
 def escalate(reason: str) -> None:
-    """Tell Sebastian through a curator request; the note counts as done only if that request exists."""
-    out = kb("add", "--new", "--type", "request", "--to", "curator", "--repo", ".agents", "--stdin",
-             f"concierge: kb #{ticket} braucht dich",
-             stdin=f"concierge hat kb #{ticket} Notiz {note} nicht bearbeitet: {reason}. Bitte selbst ansehen.")
+    """Tell Sebastian through a curator request; the note counts as done only if that request exists.
+    One open request per ticket: a later escalation for the same ticket becomes a note on it."""
+    title = f"concierge: kb #{ticket} braucht dich"
+    text = f"concierge hat kb #{ticket} Notiz {note} nicht bearbeitet: {reason}. Bitte selbst ansehen."
+    existing = open_escalation(title)
+    if existing:
+        out = kb("note", str(existing), "-", stdin=text)
+    else:
+        out = kb("add", "--new", "--type", "request", "--to", "curator", "--repo", ".agents", "--stdin",
+                 title, stdin=text)
     save()
+    if out.returncode != 0:
+        print(f"kb-agent-concierge: escalation for kb #{ticket} failed: {out.stderr.strip()}", file=sys.stderr)
     sys.exit(0 if out.returncode == 0 else 1)
 
 

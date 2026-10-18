@@ -121,7 +121,9 @@ detached, with `KB_DB`, `KB_FIRST_NOTE` and `KB_LAST_NOTE` set; `<db dir>/notify
 the newest note they were started for, so a crashed writer is caught up by the next command.
 `tools/kb-watch --for <name> [--exec CMD]` follows the notes for one session name with inotify
 (no polling), for a session that waits for an answer. `tools/` also holds the restricted
-wrappers `kb-concierge` and `kb-remote` and the headless `kb-agent-concierge`.
+wrappers `kb-concierge` and `kb-remote` and the headless `kb-agent-concierge`. On beelink the
+concierge is disabled since 2026-10-19: its hook lies in `<db dir>/notify.disabled/`, not in
+`notify.d/` (its only clients, the Paperclip agents, were shut down on 2026-10-06).
 
 `kb --version` adds `-dirty` to the commit when `kb` differs from it, and prints the bare release
 for a copy outside a git checkout or without git. On a guest it reports the guest's own `kb`.

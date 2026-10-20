@@ -19,7 +19,9 @@ command unchanged.
 - Nested harnesses: the nearest harness process decides; if kb still reports several ids, add
   `--harness claude|codex|pi`. `kb name <name>` renames your session.
 - Without a harness id (a plain script, another machine over ssh): run `kb start --as <name>`
-  once and pass the printed token as `--session <token>` on every call; `kb end` ends it.
+  once and pass the printed token as `--session <token>` on every call; `kb end` ends it. A
+  machine that reaches the host over plain ssh without guest setup: read
+  [references/remote-machines.md](references/remote-machines.md).
 - The name `curator` belongs to the human decision-maker in a plain terminal on the host; a harness
   session and a guest cannot take it or act as curator.
 
@@ -44,7 +46,7 @@ command unchanged.
    still open, or nothing>"`.
 
 Keep confidential content out of ticket titles; a board viewer or export may show titles to a wider
-audience than notes. Put details into notes.
+audience than notes. Put details into notes. Never put secrets into tickets or notes.
 
 ## Requests between sessions
 

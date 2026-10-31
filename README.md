@@ -9,6 +9,9 @@ decides.
 `kb` is one Python file over one SQLite database. There is no server process. One machine, the
 host, holds the board. Other machines, the guests, use it over ssh (see "Host and guests").
 
+The host's `chief` session can record completed curator requests and withdraw unanswered requests
+to ended sessions with mandatory evidence; see [Chief disposition](docs/workflow.md#chief-disposition).
+
 Version 0.3 combines two implementations: the pidso `kb` 0.2 (lifecycle, guest mode, hints,
 guard, report, setup) as the base, and the beelink `kb.py` 1.x (push notifications, backlog,
 labels, takeover, tty curator, terse flags), whose board it imports in place. See

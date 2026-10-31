@@ -155,9 +155,9 @@ The curator sees every pending approval with its age and requesting session:
 kb board --to curator            # or: kb board --label approval
 ```
 
-The curator answers from a plain terminal on the host: it claims the request and replies (only
-the session holding a request replies, so an agent cannot record an approval itself), then the
-agent closes it:
+The curator answers from a plain terminal on the host: it claims the request and replies, then
+the agent closes it. The opener may also record the curator's answer given in its conversation;
+the board cannot verify who gave that answer.
 
 ```
 kb claim <id>                    # curator
@@ -166,11 +166,49 @@ kb close <id> --result "done"    # agent (opener); the assignee may close too
 ```
 
 A request with a recorded reply shows `answered` until it is closed; the prompt hook reminds the
-opener to close it. A request cannot be closed without a reply; its opener, its assignee, the
+opener to close it. A normal request close requires a reply; its opener, its assignee, the
 curator or a later session with the opener's name closes it. `kb close <id> --withdraw` drops an
 unanswered request (abandoned). A rejected command names the condition that failed, for example
 the missing reply note or the session that may act. One that waits longer than `KB_STALE_HOURS`
 shows `waiting>24h`.
+
+### Chief disposition
+
+A host session named `chief` may close a completed request to `curator` without a reply:
+
+```sh
+kb close <id> --result "Already completed: <what>" --evidence "<checked output, path or note>"
+```
+
+Both arguments must contain text. The close note records `chief completion` and the evidence;
+it never inserts a reply or grants approval. Evidence is supplied by the Chief and is not
+verified by kb. The Chief must inspect it before closing. This adds limited rights to the
+advisory session name, not authentication or general curator rights; a guest named `chief`
+gets no such rights, even if its token is used in a host shell. A held request requires a recorded
+end for its holder first. A human curator holding the request is exempt only after a reply records
+its decision; an undecided curator-held request stays open. This exception never permits withdrawal.
+
+The Chief may also drop an unanswered request to a recorded ended session:
+
+```sh
+kb close <id> --withdraw --result "Obsolete: <why>" --evidence "<checked proof>"
+```
+
+This records `chief withdrawal` and marks the request abandoned. The addressee may be a session
+name or the full displayed label (`name/harness·hash`). All matching sessions, and any holder,
+must have an end as their latest hook event, ordered by occurrence time then event id. A later
+start or stop protects a resumed session. Any start or stop tied with the latest end's occurrence
+time is ambiguous and blocks withdrawal regardless of arrival order, for host and guest hooks.
+This also rejects a stop and end emitted in the same second by a finished run: the Chief leaves
+such requests open for the curator. Rejections name the sessions and the lifecycle problem.
+Missing lifecycle data (including plain token sessions), an unknown addressee, `any`, `curator`, or mere inactivity
+does not prove an end. Answered requests cannot be withdrawn. These checks and the disposition
+note run in one write transaction. Neither command applies to tasks or combines with `--force`.
+An offline guest's undelivered resume is invisible to the host; the Chief must check that guest's
+state and drain pending lifecycle events on the guest with `kb spool --drain` (for example,
+`ssh <guest> kb spool --drain`) before withdrawing its requests. If guest access or state cannot be
+checked, leave the request open. The board's recorded end alone cannot prove an offline guest
+is still ended.
 
 ## Board flags
 

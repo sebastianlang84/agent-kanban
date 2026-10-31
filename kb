@@ -1221,6 +1221,8 @@ def closing_text(args, kind):
 def cmd_close(args):
     conn = connect()
     me, name = session(conn, args)
+    if args.evidence is not None:
+        return chief_close(conn, args, me, name)
     t = now()
     row = conn.execute('SELECT type, status, assignee, opener FROM ticket WHERE id=?',
                        (args.id,)).fetchone()
@@ -1272,6 +1274,91 @@ def cmd_close(args):
         require(conn, cur.rowcount == 1, args.id, action, me, name)
         add_note(conn, args.id, me, kind, text)
     print('ticket %d: done' % args.id)
+
+
+def session_end_problem(conn, token):
+    """Why the recorded lifecycle cannot establish an end, or an empty string."""
+    row = conn.execute(
+        'SELECT e.event, e.time FROM session s JOIN session_event e'
+        ' ON e.installation=s.installation AND e.harness=s.harness'
+        ' AND e.harness_session=s.harness_session WHERE s.token=?'
+        " AND s.harness_session<>'' ORDER BY e.time DESC, e.id DESC LIMIT 1",
+        (token,)).fetchone()
+    if row is None:
+        return 'no recorded lifecycle end'
+    if row[0] != 'end':
+        return 'latest hook is %s' % row[0]
+    # Both guest replay and concurrent host hooks can store an end after a same-second
+    # resume. Arrival order cannot resolve occurrence times with one-second precision.
+    if conn.execute(
+        'SELECT 1 FROM session s JOIN session_event e ON e.installation=s.installation'
+        ' AND e.harness=s.harness AND e.harness_session=s.harness_session'
+        " WHERE s.token=? AND e.time=? AND e.event IN ('start', 'stop')",
+        (token, row[1])).fetchone():
+        return 'ambiguous end: start or stop in the same second'
+    return ''
+
+
+def chief_close(conn, args, me, name):
+    """Host chief: record completion, never approval, or withdraw an orphan request."""
+    if name != 'chief' or GUEST is not None:
+        raise Rejected('close --evidence rejected: host chief only')
+    result, evidence = (args.result or '').strip(), args.evidence.strip()
+    if not result or not evidence:
+        raise UsageError('close --evidence needs non-empty --result and --evidence')
+    if args.force or any(p is not None for p in (args.where, args.changed, args.open)):
+        raise UsageError('close --evidence cannot combine with --force or task closing lines')
+    with transaction(conn):
+        host_inst = host_installation(conn)
+        if not conn.execute('SELECT 1 FROM session WHERE token=? AND installation=?',
+                            (me, host_inst)).fetchone():
+            raise Rejected('close --evidence rejected: host chief only')
+        row = conn.execute('SELECT type, status, addressee, assignee FROM ticket WHERE id=?',
+                           (args.id,)).fetchone()
+        require(conn, row is not None, args.id, 'close')
+        kind, status, addressee, assignee = row
+        if kind != 'request' or status not in ('todo', 'doing', 'blocked'):
+            raise Rejected('close --evidence rejected: needs an open request')
+        if args.withdraw:
+            if addressee in (None, '', 'any', CURATOR):
+                raise Rejected('withdraw --evidence rejected: needs a named ended addressee')
+            recipients = conn.execute(
+                'SELECT token, slabel(name, harness, token) FROM session'
+                ' WHERE name=? OR slabel(name, harness, token)=?',
+                (addressee, addressee)).fetchall()
+            problems = [(label, session_end_problem(conn, token)) for token, label in recipients]
+            unknown = ['%s (%s)' % (label, why) for label, why in problems if why]
+            if not recipients or unknown:
+                raise Rejected('withdraw --evidence rejected: %s' % (
+                    ', '.join(unknown) if unknown else 'unknown addressee: %s' % addressee))
+            if conn.execute("SELECT 1 FROM note WHERE ticket_id=? AND kind='reply'",
+                            (args.id,)).fetchone():
+                raise Rejected('withdraw --evidence rejected: request has a reply')
+        elif addressee != CURATOR:
+            raise Rejected('close --evidence rejected: completion needs a curator request')
+        # A human curator has no end hook. Only a recorded reply makes its held
+        # decision available for Chief completion; this never permits withdrawal.
+        curator_holds = not args.withdraw and conn.execute(
+            'SELECT 1 FROM session WHERE token=? AND name=? AND installation=?'
+            " AND harness_session=''", (assignee, CURATOR, host_inst)).fetchone()
+        if curator_holds:
+            if not conn.execute("SELECT 1 FROM note WHERE ticket_id=? AND kind='reply'",
+                                (args.id,)).fetchone():
+                raise Rejected('close --evidence rejected: held by curator without a reply;'
+                               ' the curator records its decision or closes it')
+        elif assignee is not None:
+            problem = session_end_problem(conn, assignee)
+            if problem:
+                label = conn.execute('SELECT slabel(name, harness, token) FROM session'
+                                     ' WHERE token=?', (assignee,)).fetchone()[0]
+                raise Rejected('close --evidence rejected: holder %s (%s)' % (label, problem))
+        target = 'abandoned' if args.withdraw else 'done'
+        conn.execute('UPDATE ticket SET status=?, assignee=?, updated=? WHERE id=?',
+                     (target, None if args.withdraw else assignee, now(), args.id))
+        add_note(conn, args.id, me, 'comment' if args.withdraw else 'close',
+                 'chief %s: %s\nevidence: %s' % (
+                     'withdrawal' if args.withdraw else 'completion', result, evidence))
+    print('ticket %d: %s' % (args.id, target))
 
 
 def withdraw(conn, args, me, name, row):
@@ -3868,6 +3955,8 @@ def build_parser():
     s.add_argument('--changed', help='task: what changed')
     s.add_argument('--open', help="task: what is still open ('nothing' if so)")
     s.add_argument('--result', help='closing note in one line (requests)')
+    s.add_argument('--evidence', help='host chief: completion proof, or orphan withdrawal proof;'
+                   ' requires --result')
     s.add_argument('--withdraw', action='store_true',
                    help='request: drop it without a reply (abandoned)')
     cmd('abandon', cmd_abandon, 'todo -> abandoned (opener or curator)', [ident, text], ticket=True)

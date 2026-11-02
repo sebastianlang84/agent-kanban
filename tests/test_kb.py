@@ -48,7 +48,7 @@ class KbCase(unittest.TestCase):
                     if k not in ('KB_SESSION', 'KB_TEST_BARRIER', 'KB_STALE_HOURS',
                                  'CLAUDE_CODE_SESSION_ID', 'CODEX_SESSION_ID', 'PI_SESSION_ID',
                                  'CODEX_THREAD_ID', 'KB_HARNESS', 'KB', 'BRAIN_SESSION_CONTEXT',
-                                 'PI_SUBAGENT_DEPTH')}
+                                 'PI_SUBAGENT_DEPTH', 'KB_CLIENT', 'SSH_CLIENT', 'TMUX', 'HERDR_ENV')}
         self.env['KB_DB'] = self.db
         self.env['KB_TEST_NO_PROC'] = '1'  # the suite may itself run inside an agent harness
         # kb reads and writes its config (installation id) under HOME / XDG_CONFIG_HOME.
@@ -581,7 +581,7 @@ class IdentityTest(KbCase):
 
     def test_schema_version(self):
         self.start('alice')
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 6)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 7)
         self.assertEqual(self.query('PRAGMA journal_mode')[0][0], 'wal')
 
 
@@ -698,7 +698,7 @@ class MigrationTest(KbCase):
         make_v1(self.db)
         before = [self.query('SELECT * FROM %s ORDER BY 1' % t) for t in ('session', 'card', 'note')]
         self.assertIn('old work', self.ok('board'))
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 6)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 7)
         self.assertEqual(self.query('SELECT token, name, harness, host, worktree, started'
                                     ' FROM session'), before[0])
         self.assertEqual(self.query('SELECT harness_session, last_seen FROM session'),
@@ -714,11 +714,13 @@ class MigrationTest(KbCase):
         tables = ('session', 'card', 'note', 'session_event', 'meta', 'sqlite_sequence')
         before = [self.query('SELECT * FROM %s ORDER BY 1' % t) for t in tables]
         self.assertIn('old work', self.ok('board', '--all'))
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 6)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 7)
         after = [self.query('SELECT * FROM %s ORDER BY 1' % t)
                  for t in ('session', 'ticket', 'note', 'session_event', 'meta', 'sqlite_sequence')]
-        # v5 appends installation to session and installation, event_id, received to events.
-        self.assertEqual([r[:-1] for r in after[0]], before[0])
+        # v5 appends installation to session and installation, event_id, received to events;
+        # v7 appends an empty client to session.
+        self.assertEqual([r[:-2] for r in after[0]], before[0])
+        self.assertEqual({r[-1] for r in after[0]}, {''})
         self.assertEqual(after[1:3], before[1:3])
         self.assertEqual([r[:-3] for r in after[3]], before[3])
         # v4 adds the prompt-hint cutoff to meta and an empty hint_seen table, v5 the host's id.
@@ -760,7 +762,7 @@ class MigrationTest(KbCase):
         make_v2(backup)
         cur = self.start('curator')
         self.assertIn('reconcile #1 ', self.ok('restore', backup, '--session', cur))
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 6)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 7)
         self.assertEqual(self.notes(1), [('comment', 'hello'), ('reply', 'second')])
 
     def test_restore_accepts_v1_backup(self):
@@ -769,7 +771,7 @@ class MigrationTest(KbCase):
         cur = self.start('curator')
         self.ok('hook', 'start', '--harness', 'pi', '--id', 'live-pi', '--cwd', self.tmp)
         self.assertIn('reconcile #1 ', self.ok('restore', backup, '--session', cur))
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 6)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 7)
         names = sorted(r[0] for r in self.query('SELECT name FROM session'))
         self.assertEqual(names, sorted(['curator', 'nightshift', os.path.basename(self.tmp)]))
         self.assertEqual(self.query('SELECT harness_session, event FROM session_event'),
@@ -1766,14 +1768,58 @@ class SessionsTest(KbCase):
         out = self.ok('sessions') + self.ok('sessions', '--all')
         recent = self.lines()
         self.assertEqual(sorted(recent), sorted([name, 'script']))
-        self.assertEqual(recent[name], [name, 'claude,codex', '2', '0m', '1/1', 'host'])
-        self.assertEqual(recent['script'], ['script', '-', '1', '0m', '0/0', 'host'])
+        self.assertEqual(recent[name], [name, 'claude,codex', '2', '0m', '1/1', 'host', '-'])
+        self.assertEqual(recent['script'], ['script', '-', '1', '0m', '0/0', 'host', '-'])
         every = self.lines('--all')
         self.assertEqual(every['ancient'], ['ancient', 'claude', '2', '20d', '0/0',
-                                            'host,' + 'ab' * 8])
+                                            'host,' + 'ab' * 8, '-'])
         self.assertEqual(list(every)[-1], 'ancient')  # last seen first
         for t, in self.query('SELECT token FROM session'):
             self.assertNotIn(t, out)
+
+    def fake_getent(self, line):
+        """A getent on PATH that prints line for any address."""
+        bin_dir = os.path.join(self.tmp, 'bin')
+        os.makedirs(bin_dir, exist_ok=True)
+        path = os.path.join(bin_dir, 'getent')
+        with open(path, 'w') as f:
+            f.write('#!/bin/sh\n' + ('echo "%s"\n' % line if line else 'exit 2\n'))
+        os.chmod(path, 0o755)
+        return bin_dir + os.pathsep + self.env['PATH']
+
+    def test_client_order_names_and_display(self):
+        path = self.fake_getent('100.73.5.86  c940-2026.tail027324.ts.net')
+        ssh = dict(self.env, PATH=path, SSH_CLIENT='100.73.5.86 57719 22')
+        os.makedirs(os.path.join(self.home, '.config', 'agent-kanban'), exist_ok=True)
+        with open(os.path.join(self.home, '.config', 'agent-kanban', 'config'), 'a') as f:
+            f.write('KB_CLIENT_NAMES=seb-pc2021:seb-pc, c940-2026:c940\n')
+        tid = self.ok('add', '--claim', 'from c940', '--repo', 'r',
+                      env=dict(ssh, CLAUDE_CODE_SESSION_ID='cc-1'))
+        # KB_CLIENT wins over SSH_CLIENT; tmux and herdr ignore an inherited SSH_CLIENT.
+        self.ok('note', tid, 'phone', env=dict(ssh, CODEX_SESSION_ID='cx-1', KB_CLIENT='telegram'))
+        self.ok('note', tid, 'tmux', env=dict(ssh, PI_SESSION_ID='p-1', TMUX='/tmp/t,1,0'))
+        self.ok('note', tid, 'herdr', env=dict(ssh, CODEX_SESSION_ID='cx-2', HERDR_ENV='1'))
+        self.ok('note', tid, 'again', env=dict(ssh, CLAUDE_CODE_SESSION_ID='cc-1',
+                                                 KB_CLIENT='later'))  # set once, never changed
+        clients = dict(self.query('SELECT harness_session, client FROM session'
+                                  " WHERE harness_session<>''"))
+        self.assertEqual(clients, {'cc-1': 'c940-2026', 'cx-1': 'telegram', 'p-1': '',
+                                   'cx-2': ''})
+        self.assertIn('clients: c940/claude, telegram/codex\n', self.ok('show', tid))
+        self.assertIn('via:c940/claude,telegram/codex', self.ok('board'))
+        board = json.loads(self.ok('board', '--json'))
+        self.assertEqual(board[0]['clients'], ['c940/claude', 'telegram/codex'])
+        self.assertEqual(self.lines()[os.path.basename(self.tmp)][-1], 'c940,telegram')
+        for addr, in self.query('SELECT host || worktree || client FROM session'):
+            self.assertNotIn('100.73', addr)
+
+    def test_client_empty_when_the_address_does_not_resolve(self):
+        env = dict(self.env, PATH=self.fake_getent(''), SSH_CLIENT='100.1.2.3 1 22',
+                   CLAUDE_CODE_SESSION_ID='cc-1')
+        tid = self.ok('add', '--claim', 'unknown', '--repo', 'r', env=env)
+        self.assertEqual(self.query('SELECT client FROM session'), [('',)])
+        self.assertTrue(self.ok('show', tid).endswith('\nclients:'))
+        self.assertNotIn('via:', self.ok('board'))
 
     def test_held_ticket_lists_an_old_name_and_others_do_not_move_seen(self):
         self.ok('board')  # creates the schema

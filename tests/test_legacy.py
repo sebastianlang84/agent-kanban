@@ -117,7 +117,7 @@ class LegacyCase(KbCase):
         upper = iso(datetime.datetime.now(datetime.timezone.utc).timestamp())
         with sqlite3.connect(self.db) as conn:
             conn.row_factory = sqlite3.Row
-            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 6)
+            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 7)
             self.assertEqual(conn.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
             self.assertEqual(conn.execute('PRAGMA foreign_key_check').fetchall(), [])
             tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}

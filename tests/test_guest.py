@@ -301,7 +301,9 @@ class IdentityTest(GuestCase):
         self.assertEqual(self.code('whoami', '--session', self.start('h'), env=plain), 1)
         out = self.ok('sessions', env=g)
         line = [l.split() for l in out.splitlines() if l.startswith('guestrepo ')][0]
-        self.assertEqual(line[1:], ['claude', '1', '0m', '1/0', g['KB_INSTALLATION']])
+        # The guest's machine name is its device, not the ssh client the host sees.
+        self.assertEqual(line[1:], ['claude', '1', '0m', '1/0', g['KB_INSTALLATION'],
+                                    socket.gethostname().split('.')[0].lower()])
         for t, in self.query('SELECT token FROM session'):
             self.assertNotIn(t, out)
 
@@ -596,6 +598,10 @@ class GuestHookTest(GuestCase):
             'kb: board host boardhost unreachable: Connection to boardhost closed by remote'
             ' host.'])
         self.assertEqual(self.spool(g), [])
+        # Sessions registered by replayed events get the guest's machine name as device.
+        self.assertEqual(self.query("SELECT DISTINCT client FROM session WHERE harness_session"
+                                    " IN ('a-1', 'a-2')"),
+                         [(socket.gethostname().split('.')[0].lower(),)])
         self.assertEqual(len(self.events(g['KB_INSTALLATION'])), 2)
 
     def test_end_delivered_before_start(self):
@@ -1022,13 +1028,13 @@ class MigrationV5Test(KbCase):
         tables = ('session', 'ticket', 'note', 'session_event', 'hint_seen')
         before = [self.query('SELECT * FROM %s ORDER BY 1' % t) for t in tables]
         self.assertIn('old', self.ok('board'))
-        self.assertEqual(self.query('PRAGMA user_version'), [(6,)])
+        self.assertEqual(self.query('PRAGMA user_version'), [(7,)])
         conf = os.path.join(self.home, '.config', 'agent-kanban', 'config')
         with open(conf) as f:
             inst = f.read().strip().split('=', 1)[1]
         self.assertRegex(inst, r'^[0-9a-f]{16}$')
         after = [self.query('SELECT * FROM %s ORDER BY 1' % t) for t in tables]
-        self.assertEqual(after[0], [r + (inst,) for r in before[0]])
+        self.assertEqual(after[0], [r + (inst, '') for r in before[0]])
         self.assertEqual(after[1:3], before[1:3])
         self.assertEqual(after[3], [r + (inst, None, None) for r in before[3]])
         self.assertEqual(self.query("SELECT value FROM meta WHERE key='installation'"),

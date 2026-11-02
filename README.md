@@ -114,6 +114,14 @@ kb --version              # release, plus the commit in a git checkout: kb 0.3.0
 a held ticket whose session ended (and did not resume) or went idle shows `session-ended` or
 `idle>24h`, and another session takes it over only explicitly with `kb claim --take <id>`.
 
+Each session records once, when it is registered, the device it was started from: `KB_CLIENT`
+if set (a service such as a Telegram bot sets it in its unit), a guest's machine name, else the
+name the address in `SSH_CLIENT` resolves to (ignored inside tmux or herdr, whose `SSH_CLIENT`
+stems from an earlier login); the address itself is not stored. `kb show` lists the
+device/harness pairs of a ticket's opener, assignee and note authors as `clients:`, `kb board`
+as a `via:` flag and `kb sessions` in its CLIENTS column. A config line
+`KB_CLIENT_NAMES=seb-pc2021:seb-pc,c940-2026:c940` shows readable names instead of raw ones.
+
 ### Push notifications
 
 After every command that added notes, `kb` starts each executable in `<db dir>/notify.d/` once,

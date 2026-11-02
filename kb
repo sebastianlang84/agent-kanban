@@ -32,7 +32,7 @@ except ImportError:
     fcntl = None
 
 VERSION = '0.3.0'  # release number (SemVer); bumped in the commit tagged vVERSION
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 DEFAULT_DB = os.path.join('~', '.local', 'share', 'agent-kanban', 'board.sqlite')
 CURATOR = 'curator'
 OPEN = ('todo', 'doing', 'blocked')
@@ -190,10 +190,14 @@ CREATE TRIGGER note_no_update BEFORE UPDATE ON note
 CREATE TRIGGER note_no_delete BEFORE DELETE ON note
     BEGIN SELECT RAISE(ABORT, 'note is append-only'); END;
 """,
+    # The device a session was started from; sessions registered before stay empty.
+    6: """
+ALTER TABLE session ADD COLUMN client TEXT NOT NULL DEFAULT '';
+""",
 }
 
 SESSION_COLUMNS = ('token, name, harness, host, worktree, started, harness_session, last_seen,'
-                   ' installation')
+                   ' installation, client')
 EVENT_COLUMNS = ('harness, harness_session, event, source, cwd, time, installation, event_id,'
                  ' received')
 
@@ -535,18 +539,18 @@ def migrate_legacy(conn):
         else:
             h, hsid = harness or '', ''
         tok = token or secrets.token_hex(16)
-        conn.execute('INSERT INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        conn.execute('INSERT INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
                      % SESSION_COLUMNS, (tok, name, h, host or '', cwd or '', epoch_iso(started),
-                                         hsid, epoch_iso(last), inst))
+                                         hsid, epoch_iso(last), inst, ''))
         tokens[sid] = tok
 
     def author(sid, name, ts):
         """Token for a session id the old board referenced without a sessions row."""
         if sid not in tokens:
             tok = secrets.token_hex(16)
-            conn.execute('INSERT INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            conn.execute('INSERT INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
                          % SESSION_COLUMNS, (tok, name or sid, sid if sid == 'kb' else '', '',
-                                             '', epoch_iso(ts), '', epoch_iso(ts), inst))
+                                             '', epoch_iso(ts), '', epoch_iso(ts), inst, ''))
             tokens[sid] = tok
         return tokens[sid]
 
@@ -752,13 +756,78 @@ def find_harness_session(conn, inst, harness, hsid):
                         ' AND harness_session=?', (inst, harness, hsid)).fetchone()
 
 
-def insert_harness_session(conn, inst, harness, hsid, name, worktree, t=None, host=None):
+def client_of():
+    """The device a new session is started from, without its address: KB_CLIENT, a guest's
+    machine name, else the name the ssh client's address resolves to; '' when unknown.
+
+    In tmux or herdr SSH_CLIENT stems from the login that started the multiplexer, not from
+    the machine attached now, so it is ignored there.
+    """
+    if GUEST:  # kb serve: the host's own environment is the guest's ssh connection
+        return short_host(GUEST['host'])
+    value = os.environ.get('KB_CLIENT', '').strip()
+    if value:
+        return value
+    addr = os.environ.get('SSH_CLIENT', '').split()
+    if not addr or os.environ.get('TMUX') or os.environ.get('HERDR_ENV'):
+        return ''
+    try:
+        r = subprocess.run(['getent', 'hosts', addr[0]], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, universal_newlines=True, timeout=1)
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        return ''
+    fields = r.stdout.split() if r.returncode == 0 else []
+    return short_host(fields[1]) if len(fields) > 1 else ''
+
+
+def short_host(name):
+    """First label of a host name, lower case; '' for an address or nothing."""
+    label = name.strip().split('.')[0].lower()
+    return '' if not label or label.isdigit() or ':' in label else label
+
+
+def client_names():
+    """KB_CLIENT_NAMES=raw:shown,... from the config: readable names for raw device names."""
+    names = {}
+    for pair in setting('KB_CLIENT_NAMES').split(','):
+        raw, _, shown = pair.partition(':')
+        if raw.strip() and shown.strip():
+            names[raw.strip().lower()] = shown.strip()
+    return names
+
+
+def ticket_clients(conn, ids):
+    """{ticket id: ['device/harness', ...]} over the assignee, opener and note authors whose
+    device is known, in order of first appearance."""
+    result = {}
+    if not ids:
+        return result
+    names = client_names()
+    marks = ', '.join('?' * len(ids))
+    rows = conn.execute(
+        'SELECT x.tid, s.client, s.harness FROM ('
+        ' SELECT id AS tid, assignee AS tok, 0 AS ord FROM ticket WHERE id IN (%s)'
+        ' UNION ALL SELECT id, opener, -1 FROM ticket WHERE id IN (%s)'
+        ' UNION ALL SELECT ticket_id, author, id FROM note WHERE ticket_id IN (%s)'
+        ") x JOIN session s ON s.token=x.tok WHERE s.client<>'' ORDER BY x.tid, x.ord"
+        % (marks, marks, marks), list(ids) * 3).fetchall()
+    for tid, client, harness in rows:
+        pair = names.get(client.lower(), client) + ('/' + harness if harness else '')
+        pairs = result.setdefault(tid, [])
+        if pair not in pairs:
+            pairs.append(pair)
+    return result
+
+
+def insert_harness_session(conn, inst, harness, hsid, name, worktree, t=None, host=None,
+                           client=None):
     """Inside a write transaction: add the row unless a concurrent call did."""
     t = t or now()
+    client = client_of() if client is None else client
     host = host or (GUEST['host'] if GUEST else socket.gethostname())
-    conn.execute('INSERT OR IGNORE INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    conn.execute('INSERT OR IGNORE INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
                  % SESSION_COLUMNS, (secrets.token_hex(8), name, harness, host,
-                                     worktree, t, hsid, t, inst))
+                                     worktree, t, hsid, t, inst, client))
     return find_harness_session(conn, inst, harness, hsid)
 
 
@@ -767,9 +836,11 @@ def register(conn, harness, hsid, cwd):
     inst = installation(conn)
     row = find_harness_session(conn, inst, harness, hsid)
     if row is None:
-        name, worktree = derive_name(cwd)  # git runs outside the write lock
+        name, worktree = derive_name(cwd)  # git and getent run outside the write lock
+        client = client_of()
         with transaction(conn):
-            row = insert_harness_session(conn, inst, harness, hsid, name, worktree)
+            row = insert_harness_session(conn, inst, harness, hsid, name, worktree,
+                                         client=client)
     return row
 
 
@@ -780,14 +851,16 @@ def curator_session(conn):
              ' ORDER BY started, rowid LIMIT 1')
     row = conn.execute(query, (CURATOR, inst)).fetchone()
     if row is None:
+        client = client_of()
         with transaction(conn):  # look again under the write lock: one curator session
             row = conn.execute(query, (CURATOR, inst)).fetchone()
             if row is None:
                 t = now()
                 row = (secrets.token_hex(16), CURATOR)
-                conn.execute('INSERT INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                conn.execute('INSERT INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
                              % SESSION_COLUMNS, (row[0], CURATOR, 'human',
-                                                 socket.gethostname(), '', t, '', t, inst))
+                                                 socket.gethostname(), '', t, '', t, inst,
+                                                 client))
     return tuple(row)
 
 
@@ -971,11 +1044,11 @@ def cmd_start(args):
     # Always a new token session, also inside a harness: scripts and other machines (ssh)
     # start their own identity this way. kb name renames the calling harness session.
     token = secrets.token_hex(16)
-    t = now()
+    t, client = now(), client_of()
     with transaction(conn):
-        conn.execute('INSERT INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        conn.execute('INSERT INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
                      % SESSION_COLUMNS, (token, name, args.harness if args.harness != 'none'
-                                         else '', host, worktree, t, '', t, inst))
+                                         else '', host, worktree, t, '', t, inst, client))
     print(token)
 
 
@@ -1812,7 +1885,7 @@ def run_hook(args):
             conn, ev['inst'], ev['harness'], ev['hsid']) is None:
         cwd = ev['cwd']  # git runs outside the write lock
         ev['name'], ev['toplevel'] = derive_name(cwd if os.path.isdir(cwd) else os.getcwd())
-        ev['host'] = socket.gethostname()
+        ev['host'], ev['client'] = socket.gethostname(), client_of()
     apply_event(conn, ev)
     if ev['event'] == 'start':
         row = find_harness_session(conn, ev['inst'], ev['harness'], ev['hsid'])
@@ -1877,7 +1950,8 @@ def apply_event(conn, ev):
             return False
         row = find_harness_session(conn, *key)
         if row is None and ev.get('name') is not None:
-            row = insert_harness_session(conn, *key, ev['name'], ev['toplevel'], t, ev['host'])
+            row = insert_harness_session(conn, *key, ev['name'], ev['toplevel'], t, ev['host'],
+                                         ev.get('client'))
         if row is None:
             return True
         conn.execute('UPDATE session SET started=min(started, ?),'
@@ -2008,6 +2082,7 @@ def cmd_board(args):
     if not (args.all or args.to is not None or args.label == BACKLOG):
         kept = [r for r in rows if r[1] == 'request' or BACKLOG not in r[9].split(',')]
         hidden, rows = len(rows) - len(kept), kept
+    clients = ticket_clients(conn, [r[0] for r in rows])
     if args.json:
         items = []
         for (cid, ctype, title, crepo, status, assignee, claimed, activity, to, labels,
@@ -2017,7 +2092,8 @@ def cmd_board(args):
             items.append({'id': cid, 'type': ctype, 'status': status, 'title': title,
                           'repo': crepo, 'labels': [l for l in labels.split(',') if l],
                           'from': opener, 'to': to, 'assignee': assignee, 'created': created,
-                          'claimed_at': claimed, 'last_activity': activity, 'flags': flags})
+                          'claimed_at': claimed, 'last_activity': activity, 'flags': flags,
+                          'clients': clients.get(cid, [])})
         json.dump(items, sys.stdout, ensure_ascii=False, indent=1)
         print()
         return
@@ -2038,6 +2114,8 @@ def cmd_board(args):
                                 ended, cutoff, stale_hours,
                                 git_hint(host, worktree, branch, target, inst, here)
                                 if status in OWNED else None)
+            if cid in clients:
+                flags.append('via:' + ','.join(clients[cid]))
             print('    #%-4d %-7s %s  @%s  %s  %s' % (
                 cid, ctype, title, assignee or '-',
                 age(claimed) if status in OWNED else age(created) if status == 'todo' else '-',
@@ -2083,6 +2161,7 @@ def cmd_show(args):
                 'opener_name', 'labels', 'created', 'updated', 'claimed_at', 'last_activity',
                 'host', 'worktree', 'branch', 'merge_target'):
         print('%s: %s' % (key.replace('_name', ''), ticket[key] if ticket[key] is not None else ''))
+    print('clients: %s' % ', '.join(ticket_clients(conn, [args.id]).get(args.id, [])))
     for n in conn.execute('SELECT n.time, slabel(s.name, s.harness, s.token) AS name, n.kind,'
                           ' n.text FROM note n'
                           ' JOIN session s ON s.token=n.author WHERE n.ticket_id=? ORDER BY n.id',
@@ -2102,18 +2181,21 @@ def session_names(conn, days=None):
     """
     here = host_installation(conn)
     rows = conn.execute(
-        'SELECT s.name, s.harness, s.installation, max(s.started, coalesce(s.last_seen, \'\'),'
+        'SELECT s.name, s.harness, s.installation, s.client, max(s.started, coalesce(s.last_seen, \'\'),'
         ' coalesce((SELECT max(n.time) FROM note n WHERE n.author=s.token), \'\'),'
         ' coalesce((SELECT max(t.created) FROM ticket t WHERE t.opener=s.token), \'\')),'
         " (SELECT count(*) FROM ticket t WHERE t.assignee=s.token AND t.status='doing'),"
         " (SELECT count(*) FROM ticket t WHERE t.assignee=s.token AND t.status='blocked')"
         ' FROM session s').fetchall()
-    names = {}
-    for name, harness, inst, seen, doing, blocked in rows:
+    names, shown = {}, client_names()
+    for name, harness, inst, client, seen, doing, blocked in rows:
         n = names.setdefault(name, {'name': name, 'harnesses': set(), 'sessions': 0, 'seen': '',
-                                    'doing': 0, 'blocked': 0, 'installations': set()})
+                                    'doing': 0, 'blocked': 0, 'installations': set(),
+                                    'clients': set()})
         if harness:
             n['harnesses'].add(harness)
+        if client:
+            n['clients'].add(shown.get(client.lower(), client))
         n['sessions'] += 1
         n['seen'] = max(n['seen'], seen)
         n['doing'] += doing
@@ -2134,13 +2216,14 @@ def cmd_sessions(args):
         print('no sessions yet' if args.all else
               'no session in the last %d days; --all lists every name' % KNOWN_DAYS)
         return
-    print('%-24s %-16s %8s %5s %13s  %s' % ('NAME', 'HARNESSES', 'SESSIONS', 'SEEN',
-                                            'DOING/BLOCKED', 'INSTALLATIONS'))
+    print('%-24s %-16s %8s %5s %13s  %-13s %s' % ('NAME', 'HARNESSES', 'SESSIONS', 'SEEN',
+                                                  'DOING/BLOCKED', 'INSTALLATIONS', 'CLIENTS'))
     for n in names:
-        print('%-24s %-16s %8d %5s %13s  %s' % (
+        print('%-24s %-16s %8d %5s %13s  %-13s %s' % (
             n['name'], ','.join(sorted(n['harnesses'])) or '-', n['sessions'], age(n['seen']),
             '%d/%d' % (n['doing'], n['blocked']),
-            ','.join(sorted(n['installations'], key=lambda i: (i != 'host', i)))))
+            ','.join(sorted(n['installations'], key=lambda i: (i != 'host', i))),
+            ','.join(sorted(n['clients'])) or '-'))
 
 
 def cmd_whoami(args):
@@ -2227,7 +2310,7 @@ def cmd_restore(args):
     with transaction(mem):
         migrate(mem)  # a backup taken before a schema upgrade
     # Sessions are identity, not ticket state: live tokens stay valid after a restore.
-    mem.executemany('INSERT OR IGNORE INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    mem.executemany('INSERT OR IGNORE INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
                     % SESSION_COLUMNS,
                     conn.execute('SELECT %s FROM session' % SESSION_COLUMNS).fetchall())
     # The session log is a measurement, not ticket state: keep live events the backup lacks,
@@ -3033,7 +3116,8 @@ def ingest_event(line, inst):
     received = now()
     return eid, {'inst': inst, 'harness': d['harness'], 'hsid': d['hsid'].strip(),
                  'event': d['event'], 'source': d['source'], 'cwd': d['cwd'],
-                 'host': d['host'], 'name': safe_name(d['name']), 'toplevel': d['toplevel'],
+                 'host': d['host'], 'client': short_host(d['host']),
+                 'name': safe_name(d['name']), 'toplevel': d['toplevel'],
                  'time': min(d['time'], received), 'received': received, 'event_id': eid,
                  'live': d['live']}, None
 

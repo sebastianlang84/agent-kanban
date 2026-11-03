@@ -1199,6 +1199,66 @@ class PromptHintTest(KbCase):
         # A session of another name is not addressed.
         self.assertEqual(self.prompt(hsid='cc-3', cwd=self.tmp), '')
 
+    def test_sub_session_neither_sees_nor_claims_the_main_sessions_request(self):
+        # 03.11.2026: chief asked market-digest; a sub-session the main session had started in
+        # the same repository saw the request at its prompt and claimed it.
+        self.prompt(hsid='cc-main')
+        payload = json.dumps(dict(session_id='cc-sub', cwd=self.repo, source='startup',
+                                  hook_event_name='SessionStart'))
+        r = self.kb('hook', 'start', '--harness', 'claude', stdin=payload)
+        sub = self.query("SELECT name FROM session WHERE harness_session='cc-sub'")[0][0]
+        self.assertRegex(sub, r'^alpha-sub-[0-9a-f]{4}$')
+        self.assertIn('this session is `%s`' % sub, context(r.stdout))
+        self.assertIn('requests to `alpha` belong to that main session', context(r.stdout))
+        tid = self.ok('add', '--type', 'request', '--to', 'alpha', 'board review', '--session',
+                      self.other)
+        self.assertEqual(self.prompt(hsid='cc-sub', start=False), '')
+        sub_env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-sub')
+        self.assertNotEqual(self.code('claim', tid, env=sub_env), 0)
+        self.assertIn('request #%s "board review"' % tid, self.prompt(hsid='cc-main'))
+        self.ok('claim', tid, env=dict(self.env, CLAUDE_CODE_SESSION_ID='cc-main'))
+        # Addressed by its own name, the sub-session gets the request.
+        own = self.ok('add', '--type', 'request', '--to', sub, 'single analysis', '--session',
+                      self.other)
+        self.assertIn('request #%s ' % own, self.prompt(hsid='cc-sub', start=False))
+        self.ok('claim', own, env=sub_env)
+        # A nested run without hook events (codex exec) is a sub-session too, and holds no name.
+        codex = dict(self.env, CODEX_SESSION_ID='cx-1')
+        self.ok('add', '--claim', 'review', '--repo', 'alpha', env=codex, cwd=self.repo)
+        self.assertRegex(self.query("SELECT name FROM session WHERE harness_session='cx-1'")[0][0],
+                         r'^alpha-sub-[0-9a-f]{4}$')
+
+    def test_name_is_free_again_once_the_main_session_ended_or_went_idle(self):
+        self.prompt(hsid='cc-main')
+        end = json.dumps(dict(session_id='cc-main', cwd=self.repo, hook_event_name='SessionEnd'))
+        self.kb('hook', 'end', '--harness', 'claude', stdin=end)
+        self.prompt(hsid='cc-next')
+        self.assertEqual(self.query("SELECT name FROM session WHERE harness_session='cc-next'"),
+                         [('alpha',)])
+        self.env['KB_STALE_HOURS'] = '0.001'  # cc-next goes idle (3.6 s) without an end
+        time.sleep(5.5)  # times have one-second resolution
+        self.prompt(hsid='cc-later')
+        self.assertEqual(self.query("SELECT name FROM session WHERE harness_session='cc-later'"),
+                         [('alpha',)])
+        # The ended main session resumes while cc-later holds the name: it continues as a
+        # sub-session, so a request to alpha reaches only cc-later.
+        r = self.kb('hook', 'start', '--harness', 'claude', stdin=json.dumps(dict(
+            session_id='cc-main', cwd=self.repo, hook_event_name='SessionStart',
+            source='resume')))
+        self.assertIn('requests to `alpha` belong to that main session', context(r.stdout))
+        main = self.query("SELECT name FROM session WHERE harness_session='cc-main'")[0][0]
+        self.assertRegex(main, r'^alpha-sub-[0-9a-f]{4}$')
+        tid = self.ok('add', '--type', 'request', '--to', 'alpha', 'later', '--session',
+                      self.other)
+        self.assertEqual(self.prompt(hsid='cc-main', start=False), '')
+        self.assertNotEqual(self.code('claim', tid, env=dict(self.env,
+                                                             CLAUDE_CODE_SESSION_ID='cc-main')), 0)
+        self.assertIn('request #%s ' % tid, self.prompt(hsid='cc-later', start=False))
+        # A session resumed while nobody else holds its name keeps it.
+        self.prompt(hsid='cc-later')
+        self.assertEqual(self.query("SELECT name FROM session WHERE harness_session='cc-later'"),
+                         [('alpha',)])
+
     def test_any_request_and_claimed_or_own_requests(self):
         anyone = self.ok('add', '--claim', '--type', 'request', '--to', 'any', 'anyone?', '--session',
                          self.other)

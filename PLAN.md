@@ -184,6 +184,12 @@ name, taken from the main checkout for a linked worktree; `kb start --as <name>`
 several harness ids are set (nested harnesses), `--harness <h>` picks one; otherwise `kb` fails
 instead of guessing.
 
+Revised 2026-11-03: a session registering while a live hook session already holds that name is a
+sub-session and gets `<name>-sub-<4 hex>`, so requests to the repository name reach only its main
+session (a sub-session had claimed a request meant for its main session). The harnesses expose no
+parent link (Claude Desktop sets the same variables in main and side sessions), so the board decides
+at registration.
+
 Ownership compares the session's token only. Name, host and worktree are display and routing
 metadata; the board shows a session as `<name>/<harness>·<4 hex of the token hash>`.
 

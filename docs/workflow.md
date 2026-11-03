@@ -32,6 +32,19 @@ A harness session passes no token. `kb` takes the session from the harness's own
 variable (`CLAUDE_CODE_SESSION_ID`; `CODEX_SESSION_ID` or `CODEX_THREAD_ID`; `PI_SESSION_ID` or
 `KB_SESSION=pi:<id>`, which the pi adapter exports). The session name is the repository name; in
 a linked worktree it is the main checkout's name. `kb name <name>` renames the calling session.
+
+One session per name is the main session; requests to the name reach only it. When a harness
+session registers while a live session already holds the name, the new one is a sub-session and
+gets its own name, `<name>-sub-<4 hex>` (the hex of its board label). Live means a session with
+hook events whose latest start, stop or end is not an end, seen within `KB_STALE_HOURS` (for a
+guest's replayed event: as of its occurrence time). So a
+session that a main session starts in the same repository (a Claude Desktop side session, a
+nested `codex exec`) neither sees the main session's requests at its prompt nor can claim them;
+a request addressed to its own name reaches it. Sessions without hook events never hold a name
+this way. A resumed session keeps its row and tickets; if another live session took its name
+meanwhile, it continues as a sub-session. If the main session crashed without an
+end hook, a new session within `KB_STALE_HOURS` is a sub-session; its start hook says so, and
+`kb name <name>` takes the plain name.
 Nested harnesses (a codex call from a Claude session) inherit each other's variables: if several
 are set, the nearest harness process above `kb` decides (Linux `/proc`), else pass `--harness
 <claude|codex|pi>`. `KB_HARNESS=<h>|none` overrides the detection.

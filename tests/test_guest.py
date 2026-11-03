@@ -673,6 +673,32 @@ class GuestHookTest(GuestCase):
         self.assertEqual(started(day), '1')
         self.assertEqual(started(time.strftime('%Y-%m-%d', time.gmtime())), '0')
 
+    def test_main_and_sub_session_replayed_late_keep_their_roles(self):
+        # Both started 30 hours ago while the host was down: the main session was live when
+        # the sub-session started, so the sub-session gets its own name.
+        g = self.make_guest('laptop')
+        t = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 30 * 3600))
+        later = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 29 * 3600))
+        self.ingest(g, self.ev(g, 'start', 'main', t), self.ev(g, 'start', 'sub', t))
+        # The main session's end arrives before the start of a second child it had started.
+        self.ingest(g, self.ev(g, 'end', 'main', later))
+        self.ingest(g, self.ev(g, 'start', 'sub2', t))
+        names = dict(self.query('SELECT harness_session, name FROM session'))
+        self.assertEqual(names['main'], 'gs')
+        self.assertRegex(names['sub'], r'^gs-sub-[0-9a-f]{4}$')
+        self.assertRegex(names['sub2'], r'^gs-sub-[0-9a-f]{4}$')
+
+    def test_stale_main_ended_before_a_late_replayed_start_frees_the_name(self):
+        g = self.make_guest('laptop')
+
+        def ago(hours):
+            return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - hours * 3600))
+        self.ingest(g, self.ev(g, 'start', 'old', ago(72)))
+        self.ingest(g, self.ev(g, 'end', 'old', ago(1)))
+        self.ingest(g, self.ev(g, 'start', 'new', ago(30)))  # stale holder at its occurrence
+        self.assertEqual(self.query("SELECT name FROM session WHERE harness_session='new'"),
+                         [('gs',)])
+
     def test_concurrent_hook_writers_write_distinct_files(self):
         barrier = os.path.join(self.tmp, 'barrier')
         g = self.make_guest('laptop', FAKE_SSH_MODE='down', KB_TEST_BARRIER=barrier)

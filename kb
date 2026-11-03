@@ -819,15 +819,47 @@ def ticket_clients(conn, ids):
     return result
 
 
+def name_live(conn, name, t, token=''):
+    """True when another hook session of this name is live at time t: its latest start, stop
+    or end event up to t is not an end, and it was seen within KB_STALE_HOURS before t (a guest's
+    replayed event counts at its occurrence time). Sessions without hook events (a nested
+    codex exec, kb start) never hold a name this way."""
+    try:
+        hours = stale_cutoff()[0]
+    except UsageError:  # a hook must not fail on a bad KB_STALE_HOURS; kb board reports it
+        hours = 24
+    cutoff = fmt_time(parse_time(t) - datetime.timedelta(hours=hours))
+    # last_seen counts only up to t: activity after a replayed event's time says nothing about t
+    return conn.execute(
+        'SELECT 1 FROM session s JOIN session_event e ON e.id=(SELECT x.id FROM session_event x'
+        ' WHERE x.installation=s.installation AND x.harness=s.harness'
+        ' AND x.harness_session=s.harness_session AND x.time<=? ORDER BY x.time DESC, x.id DESC'
+        " LIMIT 1) WHERE s.name=? AND s.token<>? AND s.harness_session<>''"
+        " AND e.event IN ('start', 'stop')"
+        ' AND (e.time>=? OR coalesce(s.last_seen, s.started) BETWEEN ? AND ?) LIMIT 1',
+        (t, name, token, cutoff, cutoff, t)).fetchone() is not None
+
+
+def sub_name(name, token):
+    return '%s-sub-%s' % (name, hashlib.sha256(token.encode()).hexdigest()[:4])
+
+
 def insert_harness_session(conn, inst, harness, hsid, name, worktree, t=None, host=None,
                            client=None):
-    """Inside a write transaction: add the row unless a concurrent call did."""
+    """Inside a write transaction: add the row unless a concurrent call did.
+
+    While a live session holds the name (the repository's main session), the new one is a
+    sub-session and gets its own name, <name>-sub-<4 hex of its label>: requests and replies
+    addressed to the main session's name neither show nor can be claimed there."""
     t = t or now()
     client = client_of() if client is None else client
     host = host or (GUEST['host'] if GUEST else socket.gethostname())
+    token = secrets.token_hex(8)
+    if find_harness_session(conn, inst, harness, hsid) is None and name_live(conn, name, t):
+        name = sub_name(name, token)
     conn.execute('INSERT OR IGNORE INTO session (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-                 % SESSION_COLUMNS, (secrets.token_hex(8), name, harness, host,
-                                     worktree, t, hsid, t, inst, client))
+                 % SESSION_COLUMNS, (token, name, harness, host, worktree, t, hsid, t, inst,
+                                     client))
     return find_harness_session(conn, inst, harness, hsid)
 
 
@@ -1891,7 +1923,7 @@ def run_hook(args):
         row = find_harness_session(conn, ev['inst'], ev['harness'], ev['hsid'])
         if row is not None:
             with transaction(conn):
-                text = start_context(conn, row[0], row[1])
+                text = start_context(conn, row[0], row[1], ev.get('name') or ev.get('base'))
                 if text:
                     emit(args, 'SessionStart', text)
 
@@ -1907,14 +1939,18 @@ def emit(args, event, text):
     sys.stdout.flush()
 
 
-def start_context(conn, token, name):
+def start_context(conn, token, name, base=None):
     """Inside a write transaction: what a new session should know about the board.
 
-    Its name, and tickets of its repository whose holder ended or went idle, which it may
-    take over with kb claim --take. The prompt hints follow at the first prompt.
+    Its name (and, for a sub-session, the main session's name base), and tickets of its
+    repository whose holder ended or went idle, which it may take over with kb claim --take.
+    The prompt hints follow at the first prompt.
     """
     lines = ['kb: this session is `%s` on the shared board (`kb board`); requests and'
              ' replies for it follow at its prompts.' % name]
+    if base and name != base:
+        lines.append('kb: a live session already holds `%s`, so this one is a sub-session;'
+                     ' requests to `%s` belong to that main session, not to you.' % (base, base))
     repo = conn.execute('SELECT worktree FROM session WHERE token=?', (token,)).fetchone()
     repo = repo_name(repo[0]) if repo and repo[0] and not GUEST else ''
     if repo:
@@ -1954,6 +1990,10 @@ def apply_event(conn, ev):
                                          ev.get('client'))
         if row is None:
             return True
+        if ev['event'] == 'start' and name_live(conn, row[1], t, row[0]):
+            # resumed while another session took over its name: it continues as a sub-session
+            ev['base'], row = row[1], (row[0], sub_name(row[1], row[0]))
+            conn.execute('UPDATE session SET name=? WHERE token=?', (row[1], row[0]))
         conn.execute('UPDATE session SET started=min(started, ?),'
                      ' last_seen=max(coalesce(last_seen, ?), ?) WHERE token=?',
                      (t, seen, seen, row[0]))

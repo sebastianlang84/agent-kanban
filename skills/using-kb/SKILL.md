@@ -16,6 +16,9 @@ command unchanged.
 
 - A harness session (Claude Code, codex, pi) needs no token: kb reads the harness's session id and
   names the session after its git repository (the main checkout's name in a linked worktree).
+  While a live session already holds that name (the repository's main session), a new one is a
+  sub-session named `<repo>-sub-<4 hex>`: requests to `<repo>` are not yours, and you see and
+  claim only those addressed to your own name. Never rename a sub-session to the repository name.
 - Nested harnesses: the nearest harness process decides; if kb still reports several ids, add
   `--harness claude|codex|pi`. `kb name <name>` renames your session.
 - Without a harness id (a plain script, another machine over ssh): run `kb start --as <name>`

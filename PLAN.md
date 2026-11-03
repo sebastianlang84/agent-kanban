@@ -186,7 +186,7 @@ instead of guessing.
 
 Revised 2026-11-03: a session registering while a live hook session already holds that name is a
 sub-session and gets `<name>-sub-<4 hex>`, so requests to the repository name reach only its main
-session (a sub-session had claimed a request meant for its main session). The harnesses expose no
+session (found on review: a sub-session could see and claim requests meant for its main session). The harnesses expose no
 parent link (Claude Desktop sets the same variables in main and side sessions), so the board decides
 at registration.
 

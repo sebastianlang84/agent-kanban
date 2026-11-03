@@ -1200,8 +1200,8 @@ class PromptHintTest(KbCase):
         self.assertEqual(self.prompt(hsid='cc-3', cwd=self.tmp), '')
 
     def test_sub_session_neither_sees_nor_claims_the_main_sessions_request(self):
-        # 03.11.2026: chief asked market-digest; a sub-session the main session had started in
-        # the same repository saw the request at its prompt and claimed it.
+        # A sub-session that a main session starts in the same repository must neither see
+        # nor claim requests addressed to the repository name.
         self.prompt(hsid='cc-main')
         payload = json.dumps(dict(session_id='cc-sub', cwd=self.repo, source='startup',
                                   hook_event_name='SessionStart'))

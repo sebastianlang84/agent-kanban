@@ -1470,7 +1470,9 @@ class PromptHintTest(KbCase):
         conn.commit()
         conn.close()
         self.assertEqual(self.prompt(), '')
-        self.assertEqual(self.query('SELECT count(*) FROM hint_seen')[0][0], 0)
+        # Migration suppresses old request hints for this name. Project snapshots have
+        # independent per-token marks, even when the first prompt has no project notes.
+        self.assertEqual(self.query('SELECT count(*) FROM hint_seen WHERE name=?', 'alpha')[0][0], 0)
         self.assertTrue(tid)
 
     def test_limit_summarises_the_rest(self):

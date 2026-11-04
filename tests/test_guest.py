@@ -567,10 +567,10 @@ class GuestHookTest(GuestCase):
         self.ingest(g, self.ev(g, 'start', 'chief-replay', stamp, live=True, name='worker'))
         self.ingest(g, self.ev(g, 'end', 'chief-replay', stamp, name='worker'))
         token = self.query("SELECT token FROM session WHERE harness_session='chief-replay'")[0][0]
-        for to, withdraw in (('worker', True), ('curator', False)):
+        for to, withdraw in (('worker', True), ('worker', False), ('curator', False)):
             ticket = self.ok('add', 'replay request', '--new', '--type', 'request',
                              '--to', to, '--session', chief)
-            if not withdraw:  # the same ambiguity must protect a holder too
+            if to == 'curator':  # the same ambiguity must protect a holder too
                 conn = sqlite3.connect(self.db)
                 try:
                     conn.execute("UPDATE ticket SET status='doing', assignee=? WHERE id=?",
@@ -582,7 +582,7 @@ class GuestHookTest(GuestCase):
             r = self.kb('close', ticket, '--session', chief, '--result', 'obsolete',
                         '--evidence', 'proof', *flags)
             self.assertEqual(r.returncode, 1, r.stderr)
-            self.assertEqual(self.ticket(ticket)[0], 'todo' if withdraw else 'doing')
+            self.assertEqual(self.ticket(ticket)[0], 'doing' if to == 'curator' else 'todo')
         # A genuinely later end proves the state even if an older start arrives last.
         self.ingest(g, self.ev(g, 'end', 'chief-replay', iso(-30), name='worker'))
         self.ingest(g, self.ev(g, 'start', 'chief-replay', iso(-120), name='worker'))
@@ -591,6 +591,11 @@ class GuestHookTest(GuestCase):
         self.ok('close', ticket, '--session', chief, '--withdraw', '--result', 'obsolete',
                 '--evidence', 'proof')
         self.assertEqual(self.ticket(ticket)[0], 'abandoned')
+        completed = self.ok('add', 'completed request', '--new', '--type', 'request',
+                            '--to', 'worker', '--session', chief)
+        self.ok('close', completed, '--session', chief, '--result', 'already completed',
+                '--evidence', 'verified output')
+        self.assertEqual(self.ticket(completed)[0], 'done')
 
     def test_down_host_spools_and_exits_0_silently(self):
         g = self.make_guest('laptop', FAKE_SSH_MODE='down')

@@ -194,7 +194,8 @@ shows `waiting>24h`.
 
 ### Chief disposition
 
-A host session named `chief` may close a completed request to `curator` without a reply:
+A host session named `chief` may close a completed request to `curator`, or to a named
+addressee without a running session, without a reply:
 
 ```sh
 kb close <id> --result "Already completed: <what>" --evidence "<checked output, path or note>"
@@ -207,6 +208,14 @@ advisory session name, not authentication or general curator rights; a guest nam
 gets no such rights, even if its token is used in a host shell. A held request requires a recorded
 end for its holder first. A human curator holding the request is exempt only after a reply records
 its decision; an undecided curator-held request stays open. This exception never permits withdrawal.
+
+For a named addressee other than `curator`, every matching session must have a recorded end
+as its latest hook, with no start or stop in the same second. A never-registered addressee
+is allowed for completion because the Chief supplies independent evidence. A known session
+with no lifecycle record, or one that resumed, blocks completion. A full displayed session
+label selects just that session; a plain name checks every session of that name, on all
+installations. Empty addressees and `any` are excluded. A reply already on the ticket is
+preserved; none is synthesized. Claim and reply rights of repository sub-sessions do not change.
 
 The Chief may also drop an unanswered request to a recorded ended session:
 

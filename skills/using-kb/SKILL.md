@@ -94,8 +94,12 @@ A session that the instruction file names as board orchestrator routes work inst
    does that, with its own approvals.
 
 Exception for the host session named `chief`: after checking completion evidence, close a completed
-request to `curator` with `kb close <id> --result "<done>" --evidence "<proof>"`. This records
-completion, never approval. Add `--withdraw` to drop an unanswered request to an ended session;
+request to `curator`, or a named addressee with no running session, with
+`kb close <id> --result "<done>" --evidence "<proof>"`. This records completion, never approval
+or a reply. For a non-curator addressee every matching session must have a recorded lifecycle
+end; a never-registered name is allowed, but unknown lifecycle state of a known session blocks
+completion. Empty addressees and `any` are excluded. Repository sub-sessions gain no claim rights.
+Add `--withdraw` to drop an unanswered request to an ended session;
 kb requires a last end hook for every matching addressee and any holder (a full displayed session
 label narrows the matches); a human curator may hold a completed curator request only once a reply
 records its decision. Unknown lifecycle state, inactivity or a same-second start/stop and end is

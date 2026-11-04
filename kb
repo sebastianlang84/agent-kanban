@@ -1424,23 +1424,26 @@ def chief_close(conn, args, me, name):
         kind, status, addressee, assignee = row
         if kind != 'request' or status not in ('todo', 'doing', 'blocked'):
             raise Rejected('close --evidence rejected: needs an open request')
-        if args.withdraw:
+        if args.withdraw or addressee != CURATOR:
+            action = 'withdraw' if args.withdraw else 'close'
             if addressee in (None, '', 'any', CURATOR):
-                raise Rejected('withdraw --evidence rejected: needs a named ended addressee')
+                raise Rejected('%s --evidence rejected: needs a named addressee' % action)
             recipients = conn.execute(
                 'SELECT token, slabel(name, harness, token) FROM session'
                 ' WHERE name=? OR slabel(name, harness, token)=?',
                 (addressee, addressee)).fetchall()
             problems = [(label, session_end_problem(conn, token)) for token, label in recipients]
             unknown = ['%s (%s)' % (label, why) for label, why in problems if why]
-            if not recipients or unknown:
-                raise Rejected('withdraw --evidence rejected: %s' % (
-                    ', '.join(unknown) if unknown else 'unknown addressee: %s' % addressee))
-            if conn.execute("SELECT 1 FROM note WHERE ticket_id=? AND kind='reply'",
-                            (args.id,)).fetchone():
+            # Completion has independent evidence; a never-registered addressee is fine.
+            # Withdrawal still needs a recorded end for at least one matching session.
+            if unknown or (args.withdraw and not recipients):
+                raise Rejected('%s --evidence rejected: %s' % (
+                    action, ', '.join(unknown) if unknown else
+                    'unknown addressee: %s' % addressee))
+            if args.withdraw and conn.execute(
+                    "SELECT 1 FROM note WHERE ticket_id=? AND kind='reply'",
+                    (args.id,)).fetchone():
                 raise Rejected('withdraw --evidence rejected: request has a reply')
-        elif addressee != CURATOR:
-            raise Rejected('close --evidence rejected: completion needs a curator request')
         # A human curator has no end hook. Only a recorded reply makes its held
         # decision available for Chief completion; this never permits withdrawal.
         curator_holds = not args.withdraw and conn.execute(

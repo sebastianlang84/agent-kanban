@@ -77,7 +77,7 @@ class ChiefCloseTest(KbCase):
                          " WHEN NEW.text LIKE 'chief %' BEGIN"
                          " SELECT RAISE(ABORT, 'injected note failure'); END")
             conn.commit()
-        for to, extra in (('curator', ()), ('worker', ('--withdraw',))):
+        for to, extra in (('curator', ()), ('worker', ()), ('worker', ('--withdraw',))):
             with self.subTest(addressee=to):
                 ticket = self.request(to)
                 before = self.notes(ticket)
@@ -113,9 +113,55 @@ class ChiefCloseTest(KbCase):
         self.assertEqual(self.close(ticket, '--where', 'host').returncode, 3)
         self.assertEqual(self.close(999).returncode, 1)
 
-    def test_other_requests_and_curator_withdrawal_are_rejected(self):
-        self.assertEqual(self.close(self.request('worker')).returncode, 1)
+    def test_broadcast_completion_and_curator_withdrawal_are_rejected(self):
+        self.assertEqual(self.close(self.request('any')).returncode, 1)
         self.assertEqual(self.close(self.request(), '--withdraw').returncode, 1)
+
+    def test_completion_for_a_never_registered_recipient_needs_no_reply(self):
+        ticket = self.request('missing-repo')
+        before = self.notes(ticket)
+        self.assertEqual(self.close(ticket).returncode, 0)
+        self.assertEqual(self.ticket(ticket)[:2], ('done', None))
+        self.assertEqual(self.notes(ticket)[:-1], before)
+        self.assertEqual(self.query("SELECT count(*) FROM note WHERE ticket_id=?"
+                                    " AND kind='reply'", ticket), [(0,)])
+
+    def test_completion_for_ended_recipient_by_name_or_label(self):
+        token = self.recipient()
+        self.event('end')
+        label = 'worker/codex·' + hashlib.sha256(token.encode()).hexdigest()[:4]
+        for name in ('worker', label):
+            with self.subTest(addressee=name):
+                ticket = self.request(name)
+                self.assertEqual(self.close(ticket).returncode, 0)
+                self.assertEqual(self.ticket(ticket)[:2], ('done', None))
+
+    def test_completion_protects_registered_recipient_without_end(self):
+        self.recipient()
+        self.start('token-only')
+        for name in ('worker', 'token-only'):
+            with self.subTest(addressee=name):
+                ticket = self.request(name)
+                before = self.notes(ticket)
+                self.assertEqual(self.close(ticket).returncode, 1)
+                self.assertEqual(self.ticket(ticket)[:2], ('todo', None))
+                self.assertEqual(self.notes(ticket), before)
+
+    def test_completion_protects_resumed_recipient(self):
+        self.recipient()
+        self.event('end')
+        ticket = self.request('worker')
+        for event in ('start', 'stop'):
+            self.event(event)
+            self.assertEqual(self.close(ticket).returncode, 1)
+
+    def test_completion_protects_other_active_session_of_same_name(self):
+        token = self.recipient()
+        self.event('end')
+        self.recipient('worker-2')
+        self.assertEqual(self.close(self.request('worker')).returncode, 1)
+        labelled = self.request('worker/codex·' + hashlib.sha256(token.encode()).hexdigest()[:4])
+        self.assertEqual(self.close(labelled).returncode, 0)
 
     def test_plain_name_or_label_of_ended_recipient_can_be_withdrawn(self):
         token = self.recipient()
@@ -166,6 +212,9 @@ class ChiefCloseTest(KbCase):
         r = self.close(ticket, '--withdraw')
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIn('ambiguous end', r.stderr)
+        r = self.close(ticket)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn('ambiguous end', r.stderr)
 
     def test_one_active_session_of_same_name_blocks_withdrawal(self):
         token = self.recipient()
@@ -189,9 +238,10 @@ class ChiefCloseTest(KbCase):
 
     def test_ended_holder_required_for_completion_and_withdrawal(self):
         # A curator request can already be held by a worker.
-        for to, extra in (('curator', ()), ('worker', ('--withdraw',))):
+        for to, extra in (('curator', ()), ('missing-repo', ()),
+                          ('worker', ()), ('worker', ('--withdraw',))):
             with self.subTest(addressee=to):
-                hsid = 'holder-' + to
+                hsid = 'holder-' + to + str(bool(extra))
                 token = self.recipient(hsid)
                 ticket = self.request(to)
                 with closing(sqlite3.connect(self.db)) as conn:

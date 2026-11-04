@@ -85,7 +85,9 @@ event. Old prompt marks are dropped; imported requests and replies are never hin
 first (`kb.py backup`) and keep the old `kb.py` for a rollback onto that copy.
 
 Hooks record session start, activity and end, and show a session new requests and replies at its
-next prompt, and remind it to close answered requests and the tickets it holds, or to continue,
+next prompt. At its first prompt, each session also sees the last 24 hours of its project's
+board notes (time, ticket, author and first line, including closed tickets and other machines).
+Hooks remind it to close answered requests and the tickets it holds, or to continue,
 block or release a held ticket that went idle. A guard hook
 warns a session that runs git commit, merge or push or docker compose up without holding a
 ticket. They never block and always exit 0. Errors go to `hook-errors.log` in the directory

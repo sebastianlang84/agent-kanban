@@ -488,6 +488,27 @@ def iso(offset=0):
 class GuestHookTest(GuestCase):
     """Hooks on a guest (D9 step 5): deadline, spool, replay and kb hook ingest."""
 
+    def test_first_guest_prompt_receives_project_notes_for_remote_path(self):
+        g = self.make_guest('seb-pc')
+        path = 'Z:/only-on-seb-pc/alpha'
+        stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        self.ingest(g, self.ev(g, 'start', 'remote-notes', stamp,
+                               name='alpha', toplevel=path, repo='alpha'))
+        tid = self.ok('add', 'remote analyst', '--repo', 'alpha', '--session', self.curator)
+        self.ok('note', tid, 'host handoff\nfull details', '--session', self.curator)
+        prompt_path = 'Z:/only-on-seb-pc/alpha-linked-worktree'
+        argv = ['hook', 'prompt', '--harness', 'claude', '--id', 'remote-notes', '--cwd', prompt_path]
+        ctx = dict(name='alpha', toplevel=prompt_path, repo='alpha', cwd=prompt_path)
+        result = self.serve(self.request(argv, ctx), g['KB_INSTALLATION'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = context(result.stdout.decode())
+        self.assertIn('project notes for alpha', out)
+        self.assertIn('host handoff', out)
+        self.assertNotIn('full details', out)
+        again = self.serve(self.request(argv, ctx), g['KB_INSTALLATION'])
+        self.assertNotIn('project notes', again.stdout.decode())
+        self.assertEqual(self.host_errors(), [])
+
     def home_of(self, g):
         return os.path.dirname(g['KB_DB'])
 

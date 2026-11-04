@@ -66,3 +66,9 @@ class ProjectNotesTest(KbCase):
         tid = self.ok('add', 'unscoped', '--session', self.writer)
         self.ok('note', tid, 'unscoped note', '--session', self.writer)
         self.assertNotIn('project notes', self.prompt(cwd=self.tmp))
+
+    def test_empty_first_snapshot_is_not_delayed_until_notes_arrive(self):
+        self.assertNotIn('project notes', self.prompt())
+        self.ok('note', self.tid, 'after first prompt', '--session', self.writer)
+        self.assertNotIn('after first prompt', self.prompt())
+        self.assertIn('after first prompt', self.prompt('later-session'))

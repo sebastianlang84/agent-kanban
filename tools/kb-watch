@@ -12,7 +12,7 @@ Relevant for NAME are notes by others on tickets that
 
 Each new note prints one line: `kb #<ticket> <author> <kind>: <title>`.
 With --exec CMD the script also runs CMD (a failing CMD is retried on the next poll) with KB_TICKET, KB_NOTE, KB_AUTHOR, KB_KIND and KB_TITLE in the
-environment (for example a script that wakes a Paperclip agent).
+environment (for example a script that wakes an agent session).
 
 The last seen note id is kept per name in ~/.agents/state/kb/watch-<name>.last, so a restart does
 not repeat old notes. The first run starts at the newest note.

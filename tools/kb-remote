@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Forced SSH command that lets the Paperclip Orchestrator use the kb board and nothing else.
+"""Forced SSH command that lets a remote agent use the kb board and nothing else.
 
 authorized_keys: restrict,from="172.22.0.0/16",command="/home/wasti/.local/bin/kb-remote <name>" <key>
-One key per Paperclip agent; <name> is its kb session name (default: orchestrator).
+One key per remote agent; <name> is its kb session name (default: orchestrator).
 
 The client sends kb arguments, for example `ssh kb board --repo market-digest`.
 To send arguments with spaces without quoting problems, pass a JSON array on stdin:

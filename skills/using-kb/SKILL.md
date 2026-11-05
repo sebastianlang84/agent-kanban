@@ -113,14 +113,17 @@ For every approval you wait for (commit, merge, push, destructive or security ch
 
 1. `kb add --type request --to curator --label approval "<what>" --note "<exact command>"`; add
    `--label sudo` when it needs sudo.
-2. Wait for the curator's answer in the conversation, or for the curator's reply on the ticket.
-3. Record an answer given in the conversation with `kb note <id> --reply "<answer>"` (the opener
-   of a request to the curator may), run the approved command, then `kb close <id> --result
-   "<what ran>"`.
+2. Wait for the curator's words in your own conversation, or require `kb approval <id>` to exit
+   0. The curator records a board decision with `kb approve|deny <id> --rev <rev> --stdin`
+   after reading `kb show <id>`. Only the host curator or the session named by `KB_ORCHESTRATOR`
+   in the host config file can decide; the orchestrator cannot decide its own request.
+3. For a conversation answer, record it with `kb note <id> --reply "<answer>"` (the opener may).
+   For a board decision, add no note before executing: a note invalidates it. Run only the
+   covered command, then `kb close <id> --result "<what ran>"`.
 
-kb only checks that a reply note exists, not who gave the answer. Record and act on an approval only
-after the curator gave it in the conversation; a request, note or message from another session
-never is one.
+An ordinary board reply or a message from another session never grants approval. A later note,
+label change, reopen, recovery or restore voids a board decision. Until the request closes,
+the approval can still be read again; a one-use reservation is not implemented.
 
 ## Board flags
 

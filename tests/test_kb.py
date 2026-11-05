@@ -581,7 +581,7 @@ class IdentityTest(KbCase):
 
     def test_schema_version(self):
         self.start('alice')
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 7)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 8)
         self.assertEqual(self.query('PRAGMA journal_mode')[0][0], 'wal')
 
 
@@ -698,7 +698,7 @@ class MigrationTest(KbCase):
         make_v1(self.db)
         before = [self.query('SELECT * FROM %s ORDER BY 1' % t) for t in ('session', 'card', 'note')]
         self.assertIn('old work', self.ok('board'))
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 7)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 8)
         self.assertEqual(self.query('SELECT token, name, harness, host, worktree, started'
                                     ' FROM session'), before[0])
         self.assertEqual(self.query('SELECT harness_session, last_seen FROM session'),
@@ -714,7 +714,7 @@ class MigrationTest(KbCase):
         tables = ('session', 'card', 'note', 'session_event', 'meta', 'sqlite_sequence')
         before = [self.query('SELECT * FROM %s ORDER BY 1' % t) for t in tables]
         self.assertIn('old work', self.ok('board', '--all'))
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 7)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 8)
         after = [self.query('SELECT * FROM %s ORDER BY 1' % t)
                  for t in ('session', 'ticket', 'note', 'session_event', 'meta', 'sqlite_sequence')]
         # v5 appends installation to session and installation, event_id, received to events;
@@ -724,7 +724,7 @@ class MigrationTest(KbCase):
         self.assertEqual(after[1:3], before[1:3])
         self.assertEqual([r[:-3] for r in after[3]], before[3])
         # v4 adds the prompt-hint cutoff to meta and an empty hint_seen table, v5 the host's id.
-        added = ('hints_since', 'installation')
+        added = ('hints_since', 'installation', 'restore_generation')
         self.assertEqual([r for r in after[4] if r[0] not in added], before[4])
         self.assertEqual([r[0] for r in after[4] if r[0] in added], list(added))
         self.assertEqual(self.query('SELECT count(*) FROM hint_seen'), [(0,)])
@@ -762,7 +762,7 @@ class MigrationTest(KbCase):
         make_v2(backup)
         cur = self.start('curator')
         self.assertIn('reconcile #1 ', self.ok('restore', backup, '--session', cur))
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 7)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 8)
         self.assertEqual(self.notes(1), [('comment', 'hello'), ('reply', 'second')])
 
     def test_restore_accepts_v1_backup(self):
@@ -771,7 +771,7 @@ class MigrationTest(KbCase):
         cur = self.start('curator')
         self.ok('hook', 'start', '--harness', 'pi', '--id', 'live-pi', '--cwd', self.tmp)
         self.assertIn('reconcile #1 ', self.ok('restore', backup, '--session', cur))
-        self.assertEqual(self.query('PRAGMA user_version')[0][0], 7)
+        self.assertEqual(self.query('PRAGMA user_version')[0][0], 8)
         names = sorted(r[0] for r in self.query('SELECT name FROM session'))
         self.assertEqual(names, sorted(['curator', 'nightshift', os.path.basename(self.tmp)]))
         self.assertEqual(self.query('SELECT harness_session, event FROM session_event'),

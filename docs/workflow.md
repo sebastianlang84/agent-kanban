@@ -175,15 +175,31 @@ The curator sees every pending approval with its age and requesting session:
 kb board --to curator            # or: kb board --label approval
 ```
 
-The curator answers from a plain terminal on the host: it claims the request and replies, then
-the agent closes it. The opener may also record the curator's answer given in its conversation;
-the board cannot verify who gave that answer.
+The curator reads the request with `kb show` and decides on its printed `rev` from a plain
+terminal on the host. `approve` and `deny` read the curator's own words on stdin; a changed
+revision is rejected. A host session named by `KB_ORCHESTRATOR` in the host config file may
+record that decision too, but never for a request opened by its own session name. The
+environment cannot grant this role. This is the board's existing single-user identity model,
+not authentication against a hostile local process.
 
 ```
-kb claim <id>                    # curator
-kb note <id> --reply "approved"  # curator
-kb close <id> --result "done"    # agent (opener); the assignee may close too
+kb show <id>                                  # curator: read the request and rev
+printf '%s\n' '<curator words>' | kb approve <id> --rev <rev> --stdin
+kb approval <id>                              # agent: exit 0 only while still valid
+<exact approved command>                      # agent: no intervening note
+kb close <id> --result "done"                  # opener or assignee
 ```
+
+These commands require an open request to `curator` labeled `approval`. `deny` records a reply
+and closes it. Decisions and their mirrored reply notes are append-only. Ordinary reply notes
+still answer requests but do not grant approval. A new note, label change, close/reopen,
+recovery mode or restore invalidates an approval; `recover --done` never revives a restored
+decision. Guests may read `approval`, but cannot `approve` or `deny`.
+
+An approval also counts when the curator gave it in the agent's own conversation. Record that
+answer as a reply without treating an arbitrary board reply as permission. Execute only the
+covered command. A board approval remains reusable until it is invalidated or closed: an atomic
+one-use reservation for the crash window between command and close is still open.
 
 A request with a recorded reply shows `answered` until it is closed; the prompt hook reminds the
 opener to close it. A normal request close requires a reply; its opener, its assignee, the

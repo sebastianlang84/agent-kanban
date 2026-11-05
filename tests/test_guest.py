@@ -1131,7 +1131,7 @@ class MigrationV5Test(KbCase):
         tables = ('session', 'ticket', 'note', 'session_event', 'hint_seen')
         before = [self.query('SELECT * FROM %s ORDER BY 1' % t) for t in tables]
         self.assertIn('old', self.ok('board'))
-        self.assertEqual(self.query('PRAGMA user_version'), [(7,)])
+        self.assertEqual(self.query('PRAGMA user_version'), [(8,)])
         conf = os.path.join(self.home, '.config', 'agent-kanban', 'config')
         with open(conf) as f:
             inst = f.read().strip().split('=', 1)[1]

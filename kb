@@ -32,7 +32,7 @@ except ImportError:
     fcntl = None
 
 VERSION = '0.3.0'  # release number (SemVer); bumped in the commit tagged vVERSION
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DEFAULT_DB = os.path.join('~', '.local', 'share', 'agent-kanban', 'board.sqlite')
 CURATOR = 'curator'
 OPEN = ('todo', 'doing', 'blocked')
@@ -193,6 +193,24 @@ CREATE TRIGGER note_no_delete BEFORE DELETE ON note
     # The device a session was started from; sessions registered before stay empty.
     6: """
 ALTER TABLE session ADD COLUMN client TEXT NOT NULL DEFAULT '';
+""",
+    7: """
+CREATE TABLE decision (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER NOT NULL REFERENCES ticket(id),
+    verdict TEXT NOT NULL CHECK (verdict IN ('approve', 'deny')),
+    rev TEXT NOT NULL,
+    note_id INTEGER NOT NULL REFERENCES note(id),
+    author TEXT NOT NULL REFERENCES session(token),
+    time TEXT NOT NULL,
+    scope TEXT NOT NULL
+);
+CREATE INDEX decision_ticket ON decision(ticket_id);
+CREATE TRIGGER decision_no_update BEFORE UPDATE ON decision
+    BEGIN SELECT RAISE(ABORT, 'decision is append-only'); END;
+CREATE TRIGGER decision_no_delete BEFORE DELETE ON decision
+    BEGIN SELECT RAISE(ABORT, 'decision is append-only'); END;
+INSERT INTO meta (key, value) VALUES ('restore_generation', '0');
 """,
 }
 
@@ -1038,6 +1056,81 @@ def add_note(conn, ticket_id, author, kind, text, activity=True, t=None):
 
 def recovering(conn):
     return conn.execute("SELECT 1 FROM meta WHERE key='recovery'").fetchone() is not None
+
+
+def restore_generation(conn):
+    return conn.execute("SELECT value FROM meta WHERE key='restore_generation'").fetchone()[0]
+
+
+def ticket_rev(conn, ticket_id, before_note=None):
+    """Hash the request and its ordered audit trail in the caller's transaction."""
+    row = conn.execute('SELECT type, title, addressee, labels, opener, status FROM ticket'
+                       ' WHERE id=?', (ticket_id,)).fetchone()
+    if row is None:
+        raise Rejected('ticket %d does not exist' % ticket_id)
+    notes = conn.execute('SELECT id, author, time, kind, text FROM note WHERE ticket_id=?'
+                         ' AND (? IS NULL OR id < ?) ORDER BY id',
+                         (ticket_id, before_note, before_note)).fetchall()
+    payload = [restore_generation(conn), list(row), [list(n) for n in notes]]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False,
+                                    separators=(',', ':')).encode('utf-8')).hexdigest()[:16]
+
+
+def cmd_decide(args):
+    text = read_text(True)
+    conn = connect()
+    me, name = session(conn, args)
+    # Only the host file grants the orchestrator role; an environment value never does.
+    orchestrator = read_config().get('KB_ORCHESTRATOR', '')
+    with transaction(conn):
+        row = conn.execute('SELECT type, status, opener, addressee, labels FROM ticket'
+                           ' WHERE id=?', (args.id,)).fetchone()
+        if row is None:
+            raise Rejected('ticket %d does not exist' % args.id)
+        curator = is_curator(name)
+        if GUEST is not None or not (curator or (orchestrator and name == orchestrator)):
+            raise Rejected('%s rejected: host curator or configured orchestrator only'
+                           % args.command)
+        opener_name = conn.execute('SELECT name FROM session WHERE token=?',
+                                   (row[2],)).fetchone()[0]
+        if not curator and (me == row[2] or name == opener_name):
+            raise Rejected('%s rejected: orchestrator cannot decide its own request'
+                           % args.command)
+        if recovering(conn):
+            raise Rejected(RECOVERY)
+        if row[0] != 'request' or row[1] not in OPEN or row[3] != CURATOR \
+                or 'approval' not in row[4].split(','):
+            raise Rejected('%s rejected: needs an open approval request to curator'
+                           % args.command)
+        if args.rev != ticket_rev(conn, args.id):
+            raise Rejected('%s rejected: revision changed; read kb show %d again'
+                           % (args.command, args.id))
+        add_note(conn, args.id, me, 'reply', text)
+        note_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        conn.execute('INSERT INTO decision (ticket_id, verdict, rev, note_id, author, time,'
+                     ' scope) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                     (args.id, args.command, args.rev, note_id, me, now(),
+                      restore_generation(conn)))
+        if args.command == 'deny':
+            conn.execute("UPDATE ticket SET status='done', updated=? WHERE id=?",
+                         (now(), args.id))
+    print('ticket %d: %s' % (args.id, args.command))
+
+
+def cmd_approval(args):
+    conn = connect()
+    conn.execute('BEGIN')  # one snapshot for decision, notes, request and restore metadata
+    row = conn.execute('SELECT d.verdict, d.rev, d.note_id, d.scope, n.text, t.status'
+                       ' FROM decision d JOIN note n ON n.id=d.note_id'
+                       ' JOIN ticket t ON t.id=d.ticket_id WHERE d.ticket_id=?'
+                       ' ORDER BY d.id DESC LIMIT 1', (args.id,)).fetchone()
+    if not row or row[0] != 'approve' or row[5] not in OPEN or recovering(conn) \
+            or row[3] != restore_generation(conn) \
+            or conn.execute('SELECT max(id) FROM note WHERE ticket_id=?',
+                            (args.id,)).fetchone()[0] != row[2] \
+            or ticket_rev(conn, args.id, before_note=row[2]) != row[1]:
+        raise Rejected('no current approval for ticket %d' % args.id)
+    print(row[4])
 
 
 def transition(args, action, sql, params, kind, default_text):
@@ -2313,6 +2406,7 @@ def board_flags(ctype, status, to, opener, replied, created, labels, activity, e
 def cmd_show(args):
     conn = connect()
     conn.row_factory = sqlite3.Row
+    conn.execute('BEGIN')  # the printed revision and notes must describe the same snapshot
     ticket = conn.execute(
         'SELECT c.*, slabel(a.name, a.harness, a.token) AS assignee_name,'
         ' slabel(o.name, o.harness, o.token) AS opener_name FROM ticket c'
@@ -2320,6 +2414,7 @@ def cmd_show(args):
         ' WHERE c.id=?', (args.id,)).fetchone()
     if ticket is None:
         raise Rejected('ticket %d does not exist' % args.id)
+    print('rev: %s' % ticket_rev(conn, args.id))
     for key in ('id', 'type', 'title', 'repo', 'status', 'addressee', 'assignee_name',
                 'opener_name', 'labels', 'created', 'updated', 'claimed_at', 'last_activity',
                 'host', 'worktree', 'branch', 'merge_target'):
@@ -2486,6 +2581,9 @@ def cmd_restore(args):
                     [r + (r[7], r[7], r[6]) + r[:6] for r in conn.execute(
                         'SELECT %s FROM session_event ORDER BY id' % EVENT_COLUMNS)])
     mem.execute("INSERT OR REPLACE INTO meta VALUES ('recovery', ?)", (now(),))
+    # A fresh generation invalidates decisions from every backup, even after recover.
+    mem.execute("INSERT OR REPLACE INTO meta VALUES ('restore_generation', ?)",
+                (secrets.token_hex(16),))
     # The board stays this host's, also when the backup came from another host; its rows
     # keep their own installation values.
     mem.execute("INSERT OR REPLACE INTO meta VALUES ('installation', ?)", (live,))
@@ -2843,8 +2941,8 @@ CTX_FIELDS = ('host', 'cwd', 'name', 'toplevel', 'repo', 'branch')
 # Every command a guest may run; curator-only and host-only ones are missing on purpose.
 GUEST_COMMANDS = ('start', 'add', 'claim', 'block', 'resume', 'release', 'close', 'abandon',
                   'reopen', 'note', 'touch', 'session-ended', 'board', 'show', 'report',
-                  'sessions', 'whoami')
-HOST_ONLY = ('restore', 'recover', 'serve', 'authorize')
+                  'sessions', 'whoami', 'approval')
+HOST_ONLY = ('restore', 'recover', 'serve', 'authorize', 'approve', 'deny')
 STDIN_COMMANDS = ('note', 'close')  # read note text always; the others only with --stdin
 
 
@@ -4147,6 +4245,14 @@ def build_parser():
                    help='only tickets closed in the last DAYS days')
     s.add_argument('--json', action='store_true', help='one JSON list, for scripts')
     cmd('show', cmd_show, 'show a ticket and its notes', ticket=True)
+    for verdict in ('approve', 'deny'):
+        s = cmd(verdict, cmd_decide, 'host: record a revision-bound curator decision',
+                [ident], ticket=True)
+        s.add_argument('--rev', required=True, help='revision printed by kb show')
+        s.add_argument('--stdin', required=True, action='store_true',
+                       help="read the curator's own words from stdin")
+    cmd('approval', cmd_approval, 'print a still-current approval (exit 1 otherwise)',
+        ticket=True)
     s = cmd('sessions', cmd_sessions, 'session names seen in the last %d days or holding a'
             ' ticket, last seen first (read-only)' % KNOWN_DAYS)
     s.add_argument('--all', action='store_true', help='every current session name')

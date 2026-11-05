@@ -217,6 +217,11 @@ host/guest protocol (`REQUEST_VERSION`, the request `kb serve` reads) or to the 
 MINOR release while 0.x. Migrations stay automatic: a newer `kb` migrates an older board, and an
 older `kb` refuses a newer one.
 
+Unreleased integration work adds revision-bound `approve`, `deny` and read-only `approval`
+commands and migrates the board to schema 8. This requires at least `0.4.0` for the next
+release; the version bump and annotated release tag are deferred to a separately authorized
+release. See [Approvals](docs/workflow.md#approvals) for validity and the remaining crash window.
+
 ## Documentation
 
 - [`docs/workflow.md`](docs/workflow.md): steps, identity, hooks, approvals, flags, `kb report`

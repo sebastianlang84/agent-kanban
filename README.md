@@ -118,6 +118,9 @@ kb --version              # release, plus the commit in a git checkout: kb 0.3.0
 `kb board --json` prints one JSON list for scripts. A ticket is never released automatically:
 a held ticket whose session ended (and did not resume) or went idle shows `session-ended` or
 `idle>24h`, and another session takes it over only explicitly with `kb claim --take <id>`.
+Use `kb release <id> --to <known-name> --stdin` for an explicit handoff; `kb board --to <name>`
+shows its pending tasks and requests. `kb board --stranded` collects abandoned claims and
+unclaimed handoff tasks for a sweep. See [Explicit handoffs](docs/workflow.md#explicit-handoffs).
 
 Each session records once, when it is registered, the device it was started from: `KB_CLIENT`
 if set (a service such as a Telegram bot sets it in its unit), a guest's machine name, else the
@@ -218,7 +221,9 @@ MINOR release while 0.x. Migrations stay automatic: a newer `kb` migrates an old
 older `kb` refuses a newer one.
 
 Unreleased integration work adds revision-bound `approve`, `deny` and read-only `approval`
-commands and migrates the board to schema 9. Reopened requests now require a fresh reply. This requires at least `0.4.0` for the next
+commands and migrates the board to schema 9. Reopened requests now require a fresh reply;
+named handoffs and a stranded-work sweep preserve ownership between sessions.
+This requires at least `0.4.0` for the next
 release; the version bump and annotated release tag are deferred to a separately authorized
 release. See [Approvals](docs/workflow.md#approvals) for validity and the remaining crash window.
 

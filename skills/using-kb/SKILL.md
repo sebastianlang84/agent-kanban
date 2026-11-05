@@ -42,7 +42,10 @@ command unchanged.
    - Before `kb add`, apply the work-item rules of the `code-documentation` skill: move a matching
      `TODO.md` item into the ticket and remove it from `TODO.md`.
 3. Record progress or findings with `kb note <id> <text>` (or the text on stdin).
-4. If you cannot finish, `kb release <id> --why "<what is done, what is open>"`. Use
+4. If you cannot finish, `kb release <id> --why "<what is done, what is open>"`. For a named
+   next session, use `kb release <id> --to <known-name> --stdin`: only that name may claim it;
+   the note keeps the source branch/worktree. Only the last releaser or curator may retarget
+   an unclaimed handoff. `kb board --to <name>` includes handoff tasks as well as requests. Use
    `kb block <id>` / `kb resume <id>` for a pause that you will pick up yourself. Park an idea with
    `kb label <id> backlog` (hidden from `kb board`).
 5. At the end, `kb close <id> --where "<deployed where>" --changed "<what changed>" --open "<what is
@@ -77,8 +80,10 @@ audience than notes. Put details into notes. Never put secrets into tickets or n
 
 A session that the instruction file names as board orchestrator routes work instead of doing it:
 
-1. Read `kb board`. Find each open ticket's owner: for a request, its addressee (a session name,
-   which is a repository name); for a task, its `repo`. If neither names a repository, or the
+1. Read `kb board` and `kb board --stranded` for the daily sweep (holders ended at least one
+   hour ago or idle, excluding curator, plus unclaimed task handoffs). Find each open ticket's
+   owner: for a request or named handoff, its addressee; otherwise a task's `repo`. Never route
+   it back to an ended holder. If neither names a repository, or the
    addressee is `any`, ask the user.
 2. Leave tickets owned by this session's own repository to the normal task workflow.
 3. Hand every other ticket to its owner on the board, which works in every harness:
@@ -146,6 +151,9 @@ requests and the tickets you hold; a held ticket idle longer than `KB_STALE_HOUR
 again, once per idle episode: continue it, `kb block` it with a reason, or `kb release --stdin` it
 with a handoff note. Act on it with `kb show <id>`; it appears once per session name,
 so a request you postpone stays visible only on `kb board --to <your name>`.
+Explicit handoffs also remind their addressee at prompts in the main checkout, once per release
+note and session token. Check `kb show`, then claim and verify what remains before closing.
+These reminders never run on guests or linked worktrees, including symlinks into a worktree.
 The guard hook (`kb hook guard`) warns when you commit, merge, push or run `docker compose up`
 without holding a `doing` or `blocked` ticket: run `kb add "<goal>"` or `kb claim <id>` first.
 Hooks never block and always exit 0; errors go to `hook-errors.log` next to the database. They do

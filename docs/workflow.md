@@ -26,6 +26,34 @@ session id); one without activity for `KB_STALE_HOURS` shows `idle>24h`. With ei
 another session may take it over: `kb claim --take <id>` (an `event` note records it). Without a
 flag, ask the holder with a request, or the curator to release it.
 
+### Explicit handoffs
+
+`kb release <id> --to <name> --stdin` releases a claim to a session name the board has seen.
+The ticket becomes unclaimed `todo`, addressed only to that name; both normal claims and
+takeovers respect it. Unknown names are rejected with known names to check. The release note
+preserves the source branch and worktree before the next claim replaces that metadata. Ordinary
+takeovers also preserve the previous holder's branch and worktree in their audit note.
+
+Write what is done and what remains (for example review, merge, verification or close). Only the
+last releasing session or the curator may retarget an unclaimed handoff with another
+`release --to`. Once claimed, only its new holder or the curator may release it. `board --to
+<name>` includes these tasks as well as requests, so handoffs to `curator` remain visible.
+Plain `release` returns a task to the general pool; a request keeps its addressee.
+
+At a prompt in a repository's main checkout, the addressee gets a handoff reminder to read,
+claim and check remaining work before closing. It is delivered once per release note and session
+token; one session never consumes another's reminder. The nearest `.git` entry must be a
+directory after resolving cwd symlinks. Linked worktrees (including symlinks into them),
+non-repository directories and guests receive no such reminder. The prompt performs no git
+calls. Sub-session names alone do not replace this cwd rule: sessions may be explicitly renamed.
+
+`kb board --stranded` collects doing/blocked tickets with a non-curator holder that ended at
+least one hour ago without resuming, or is idle for `KB_STALE_HOURS` (24 by default), plus
+unclaimed task handoffs. It includes backlog handoffs and composes with repo/addressee/JSON
+filters. The end cooldown applies to this sweep, not to immediate explicit takeover. Route work
+to a live responsible session rather than its ended holder. Neither a handoff nor a merged
+branch proves completion; no git-ancestry close reminder is added.
+
 ## Identity
 
 A harness session passes no token. `kb` takes the session from the harness's own environment

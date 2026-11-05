@@ -201,12 +201,19 @@ answer as a reply without treating an arbitrary board reply as permission. Execu
 covered command. A board approval remains reusable until it is invalidated or closed: an atomic
 one-use reservation for the crash window between command and close is still open.
 
-A request with a recorded reply shows `answered` until it is closed; the prompt hook reminds the
-opener to close it. A normal request close requires a reply; its opener, its assignee, the
+A request with a recorded reply since its last reopen shows `answered` until it is closed;
+the prompt hook reminds the opener to close it. Reopening preserves history but requires a
+new reply for the flag, reply/close reminders and normal close. A normal request close requires
+a current reply; its opener, its assignee, the
 curator or a later session with the opener's name closes it. `kb close <id> --withdraw` drops an
 unanswered request (abandoned). A rejected command names the condition that failed, for example
 the missing reply note or the session that may act. One that waits longer than `KB_STALE_HOURS`
 shows `waiting>24h`.
+
+The schema-9 migration backfills open tickets from their latest close, force-close, or standard
+`abandoned`/`reopened`/`curator approved: ...` comment. Historical reopens with custom text
+cannot always be identified; their history must be checked manually. Future reopens record the
+boundary atomically regardless of their note text.
 
 ### Chief disposition
 

@@ -32,7 +32,7 @@ except ImportError:
     fcntl = None
 
 VERSION = '0.3.0'  # release number (SemVer); bumped in the commit tagged vVERSION
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 DEFAULT_DB = os.path.join('~', '.local', 'share', 'agent-kanban', 'board.sqlite')
 CURATOR = 'curator'
 OPEN = ('todo', 'doing', 'blocked')
@@ -211,6 +211,14 @@ CREATE TRIGGER decision_no_update BEFORE UPDATE ON decision
 CREATE TRIGGER decision_no_delete BEFORE DELETE ON decision
     BEGIN SELECT RAISE(ABORT, 'decision is append-only'); END;
 INSERT INTO meta (key, value) VALUES ('restore_generation', '0');
+""",
+    8: """
+ALTER TABLE ticket ADD COLUMN reopened INTEGER NOT NULL DEFAULT 0;
+UPDATE ticket SET reopened=coalesce((SELECT max(n.id) FROM note n
+    WHERE n.ticket_id=ticket.id AND (n.kind IN ('close', 'force-close') OR
+        (n.kind='comment' AND (n.text IN ('abandoned', 'reopened') OR
+                              n.text LIKE 'curator approved: %')))), 0)
+    WHERE status IN ('todo', 'doing', 'blocked');
 """,
 }
 
@@ -1033,10 +1041,11 @@ def reason(conn, ticket_id, action, me=None, name=None):
     if not allowed:
         return 'only the %s may %s %s %s (%s)' % (actor, verb, kind, ticket_id,
                                                describe(conn, ticket_id))
-    if action == 'close request' and not conn.execute(
-            "SELECT 1 FROM note WHERE ticket_id=? AND kind='reply'", (ticket_id,)).fetchone():
-        return ('request %s has no reply note; add one with kb note --kind reply %s'
-                % (ticket_id, ticket_id))
+    if action == 'close request' and not current_reply(conn, ticket_id):
+        reopened = conn.execute('SELECT reopened FROM ticket WHERE id=?',
+                                (ticket_id,)).fetchone()[0]
+        return ('request %s has no reply note%s; add one with kb note --kind reply %s'
+                % (ticket_id, ' since its last reopen' if reopened else '', ticket_id))
     return describe(conn, ticket_id)
 
 
@@ -1056,6 +1065,12 @@ def add_note(conn, ticket_id, author, kind, text, activity=True, t=None):
 
 def recovering(conn):
     return conn.execute("SELECT 1 FROM meta WHERE key='recovery'").fetchone() is not None
+
+
+def current_reply(conn, ticket_id):
+    return conn.execute("SELECT 1 FROM note n JOIN ticket t ON t.id=n.ticket_id"
+                        " WHERE t.id=? AND n.kind='reply' AND n.id>t.reopened LIMIT 1",
+                        (ticket_id,)).fetchone() is not None
 
 
 def restore_generation(conn):
@@ -1399,6 +1414,7 @@ def cmd_abandon(args):
 def cmd_reopen(args):
     transition(args, 'reopen',
                "UPDATE ticket SET status='todo', assignee=NULL, claimed_at=NULL, updated=?"
+               ", reopened=(SELECT coalesce(max(id), 0) FROM note)"
                " WHERE id=? AND status IN ('done', 'abandoned') AND (opener=? OR ?)",
                lambda me, name: (now(), args.id, me, is_curator(name)), 'comment', 'reopened')
 
@@ -1465,7 +1481,8 @@ def cmd_close(args):
                 " AND status IN ('todo', 'doing', 'blocked')"
                 " AND (opener=? OR assignee=? OR ? AND (assignee IS NULL OR assignee=?)"
                 "      OR (SELECT name FROM session WHERE token=ticket.opener)=?)"
-                " AND EXISTS (SELECT 1 FROM note WHERE ticket_id=ticket.id AND kind='reply')",
+                " AND EXISTS (SELECT 1 FROM note WHERE ticket_id=ticket.id AND kind='reply'"
+                " AND note.id>ticket.reopened)",
                 (t, args.id, me, me, is_curator(name), me, name))
             kind = 'close'
             action = 'close request'
@@ -1533,9 +1550,7 @@ def chief_close(conn, args, me, name):
                 raise Rejected('%s --evidence rejected: %s' % (
                     action, ', '.join(unknown) if unknown else
                     'unknown addressee: %s' % addressee))
-            if args.withdraw and conn.execute(
-                    "SELECT 1 FROM note WHERE ticket_id=? AND kind='reply'",
-                    (args.id,)).fetchone():
+            if args.withdraw and current_reply(conn, args.id):
                 raise Rejected('withdraw --evidence rejected: request has a reply')
         # A human curator has no end hook. Only a recorded reply makes its held
         # decision available for Chief completion; this never permits withdrawal.
@@ -1543,8 +1558,7 @@ def chief_close(conn, args, me, name):
             'SELECT 1 FROM session WHERE token=? AND name=? AND installation=?'
             " AND harness_session=''", (assignee, CURATOR, host_inst)).fetchone()
         if curator_holds:
-            if not conn.execute("SELECT 1 FROM note WHERE ticket_id=? AND kind='reply'",
-                                (args.id,)).fetchone():
+            if not current_reply(conn, args.id):
                 raise Rejected('close --evidence rejected: held by curator without a reply;'
                                ' the curator records its decision or closes it')
         elif assignee is not None:
@@ -1570,12 +1584,12 @@ def withdraw(conn, args, me, name, row):
         cur = conn.execute(
             "UPDATE ticket SET status='abandoned', assignee=NULL, updated=? WHERE id=?"
             " AND type='request' AND status IN ('todo', 'doing', 'blocked')"
-            " AND NOT EXISTS (SELECT 1 FROM note WHERE ticket_id=ticket.id AND kind='reply')"
+            " AND NOT EXISTS (SELECT 1 FROM note WHERE ticket_id=ticket.id AND kind='reply'"
+            " AND note.id>ticket.reopened)"
             " AND (opener=? OR ? OR (SELECT name FROM session WHERE token=ticket.opener)=?)",
             (now(), args.id, me, is_curator(name), name))
         if cur.rowcount != 1:
-            replied = conn.execute("SELECT 1 FROM note WHERE ticket_id=? AND kind='reply'",
-                                   (args.id,)).fetchone()
+            replied = current_reply(conn, args.id)
             raise Rejected('withdraw rejected: %s; %s' % (
                 describe(conn, args.id),
                 'it has a reply, so close it without --withdraw' if replied else
@@ -1766,14 +1780,16 @@ def prompt_hints(conn, token, name):
     replies = [r for r in conn.execute(
         "SELECT n.id, t.id, t.title, slabel(a.name, a.harness, a.token), t.status FROM note n"
         " JOIN ticket t ON t.id=n.ticket_id JOIN session o ON o.token=t.opener"
-        " JOIN session a ON a.token=n.author WHERE n.kind='reply' AND t.type='request'"
+        " JOIN session a ON a.token=n.author WHERE n.kind='reply' AND n.id>t.reopened"
+        " AND t.type='request'"
         " AND o.name=? AND n.author<>t.opener AND n.time>=? AND n.id>? ORDER BY n.id",
         (name, since, last_note))
         if 'note:%d' % r[0] not in seen]
     # Keyed by the latest reply and by the claim: a new event reminds again, a prompt never does.
     answered = [r for r in conn.execute(
         "SELECT t.id, t.title, max(r.id) FROM ticket t JOIN session o ON o.token=t.opener"
-        " JOIN note r ON r.ticket_id=t.id AND r.kind='reply' WHERE t.type='request'"
+        " JOIN note r ON r.ticket_id=t.id AND r.kind='reply' AND r.id>t.reopened"
+        " WHERE t.type='request'"
         " AND t.status IN ('todo', 'doing', 'blocked') AND o.name=? GROUP BY t.id ORDER BY t.id",
         (name,)) if 'answered:%d' % r[2] not in seen]
     latest = {r[0]: r[2] for r in answered}
@@ -2327,7 +2343,8 @@ def cmd_board(args):
         "                 AND x.harness_session=e.harness_session AND x.time=n.time"
         "                 AND x.id<e.id)))),"
         ' c.created, slabel(o.name, o.harness, o.token),'
-        " EXISTS (SELECT 1 FROM note r WHERE r.ticket_id=c.id AND r.kind='reply'),"
+        " EXISTS (SELECT 1 FROM note r WHERE r.ticket_id=c.id AND r.kind='reply'"
+        " AND r.id>c.reopened),"
         ' s.installation'
         ' FROM ticket c LEFT JOIN session s ON s.token=c.assignee'
         ' LEFT JOIN session o ON o.token=c.opener'

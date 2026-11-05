@@ -218,7 +218,7 @@ MINOR release while 0.x. Migrations stay automatic: a newer `kb` migrates an old
 older `kb` refuses a newer one.
 
 Unreleased integration work adds revision-bound `approve`, `deny` and read-only `approval`
-commands and migrates the board to schema 8. This requires at least `0.4.0` for the next
+commands and migrates the board to schema 9. Reopened requests now require a fresh reply. This requires at least `0.4.0` for the next
 release; the version bump and annotated release tag are deferred to a separately authorized
 release. See [Approvals](docs/workflow.md#approvals) for validity and the remaining crash window.
 

@@ -1131,14 +1131,15 @@ class MigrationV5Test(KbCase):
         tables = ('session', 'ticket', 'note', 'session_event', 'hint_seen')
         before = [self.query('SELECT * FROM %s ORDER BY 1' % t) for t in tables]
         self.assertIn('old', self.ok('board'))
-        self.assertEqual(self.query('PRAGMA user_version'), [(8,)])
+        self.assertEqual(self.query('PRAGMA user_version'), [(9,)])
         conf = os.path.join(self.home, '.config', 'agent-kanban', 'config')
         with open(conf) as f:
             inst = f.read().strip().split('=', 1)[1]
         self.assertRegex(inst, r'^[0-9a-f]{16}$')
         after = [self.query('SELECT * FROM %s ORDER BY 1' % t) for t in tables]
         self.assertEqual(after[0], [r + (inst, '') for r in before[0]])
-        self.assertEqual(after[1:3], before[1:3])
+        self.assertEqual([r[:-1] for r in after[1]], before[1])
+        self.assertEqual(after[2], before[2])
         self.assertEqual(after[3], [r + (inst, None, None) for r in before[3]])
         self.assertEqual(self.query("SELECT value FROM meta WHERE key='installation'"),
                          [(inst,)])

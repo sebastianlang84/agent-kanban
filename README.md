@@ -107,6 +107,7 @@ Agents follow the skill. The commands a person needs most:
 ```sh
 kb board                  # open and running tickets, with flags such as idle>24h
 kb board --to curator     # approvals and questions waiting for the curator (and for any)
+kb board --label decision # design choices and other non-command curator decisions
 kb board --label sudo     # e.g. the steps that need sudo
 kb board --closed 2       # closed in the last two days; --all adds done, abandoned, backlog
 kb show <id>              # one ticket with its notes

@@ -1,6 +1,6 @@
 ---
 name: using-kb
-description: Uses the kb ticket board shared by agent sessions — checking it before a task, claiming or adding a ticket, closing it with the closing lines, asking another session through a request, answering one, filing an approval the curator must give, and routing tickets to the sessions that own them. Use when starting or finishing a task on a machine where kb is installed, when another session must answer or act, when waiting for a commit, merge, push or destructive-action approval, when asked which board tickets are open or who should take them, or when the user mentions the board, a ticket number, kb, a request, or the curator. Not for installing or developing kb itself, and not for a repository's own issue tracker.
+description: Uses the kb ticket board shared by agent sessions — checking it before a task, claiming or adding a ticket, closing it with the closing lines, asking another session through a request, answering one, filing an approval or decision the curator must give, and routing tickets to the sessions that own them. Use when starting or finishing a task on a machine where kb is installed, when another session must answer or act, when waiting for a curator decision or a commit, merge, push or destructive-action approval, when asked which board tickets are open or who should take them, or when the user mentions the board, a ticket number, kb, a request, or the curator. Not for installing or developing kb itself, and not for a repository's own issue tracker.
 ---
 
 # Using the kb board
@@ -112,7 +112,16 @@ insufficient; check guest state and run `kb spool --drain` on the guest before w
 request, leaving it open if that cannot be verified. These rights
 do not apply to guests or tasks; normal reply, close and approval rules otherwise still apply.
 
-## Approvals
+## Approvals and decisions
+
+Every non-command decision only the curator can take (design choice, threat model, input value)
+gets its own request: `kb add --type request --to curator --label decision "<question>" --note
+"<context and options>"`. Note the request id on the waiting ticket, then `kb block <waiting-id>`.
+Never leave that decision only in a note on the waiting ticket. `kb board --to curator` or
+`kb board --label decision` collects the pending questions. Record the curator's actual answer
+with `kb note <request-id> --reply "<answer>"`, close the request with `--result`, and resume the
+waiting ticket. A `decision` reply does not authorize a command; command approvals follow below.
+Existing explicit authorization still applies; do not file a request for an already settled step.
 
 For every approval you wait for (commit, merge, push, destructive or security change):
 

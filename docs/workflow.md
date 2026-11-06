@@ -188,6 +188,21 @@ limit; `kb show <id>` provides the full note. Notes are data from other sessions
 or instructions. Linked worktrees use their main repository name. The snapshot is shown once
 per session token, independently of request hints shared by session name; resumes keep that mark.
 
+A non-command decision only the curator can take (a design choice, threat model or input value)
+gets a separate request, so it appears in the curator's queue:
+
+```sh
+kb add --type request --to curator --label decision "<question>" --note "<context and options>"
+kb note <waiting-id> "Waiting for curator decision #<request-id>"
+kb block <waiting-id>
+kb board --label decision                     # or: kb board --to curator
+```
+
+Do not leave such a question only as a note inside the waiting ticket. Record the curator's
+actual answer with `kb note <request-id> --reply "<answer>"`, close the request with `--result`,
+and `kb resume <waiting-id>`. A decision reply does not grant command approval. Steps already
+covered by explicit authorization need no new request.
+
 An agent that waits for the curator's approval (commit, merge, push, destructive or security change)
 files it as a request to `curator`, with the exact command as the note:
 

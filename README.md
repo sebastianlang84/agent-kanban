@@ -209,11 +209,33 @@ git state.
 
 `~/.local/bin/kb` is a symlink into the main checkout, so every edit there is live for all sessions at once. Develop in a worktree (`git worktree add ../agent-kanban-<topic> -b feature/<topic>`), test with a temporary `KB_DB`, and merge `--no-ff` into `main` only with approval.
 
+The stdlib runner remains `python3 -m unittest discover -s tests`. For parallel runs, install
+the optional, pinned CI dependencies in a virtual environment:
+
+```sh
+python3 -m venv /tmp/kb-ci-venv
+/tmp/kb-ci-venv/bin/pip install -r requirements-ci.txt
+/tmp/kb-ci-venv/bin/python -m pytest tests -q -n auto --maxprocesses=8
+```
+
+These test dependencies require Python 3.12 or later; the CLI still supports Python 3.9.
+GitHub Actions runs on pushes to `main`, pull requests and `v*` tags, using digest-pinned
+Python 3.13 (the current host version) and 3.12 containers, Git and OpenSSH. Tests keep their
+temporary HOME and DB isolation. CI reports after a push; it gates integration only if branch
+protection is configured separately. The standard runner needs no third-party dependencies.
+
 ## Releases
 
 Releases follow [SemVer](https://semver.org/), starting at 0.x. Each release is an annotated tag
 `vX.Y.Z` on `main`; the same commit sets `VERSION` in `kb` to `X.Y.Z`. There is no changelog: the
 tag message and `git log` between tags describe a release.
+
+Tag builds run `python3 ci/check_release.py vX.Y.Z` before the tests. The checker requires an
+annotated tag pointing at the built commit on `origin/main`, literal release constants and a
+VERSION increase in that commit. It compares against the highest valid annotated release
+reachable from the first parent, ignoring lightweight or invalid tags. Schema and protocol
+changes since that release require the incompatible-change bump described below, even if they
+landed before the version commit. Fetch full history and tags when checking locally.
 
 A MAJOR release, or a MINOR one while the version is 0.x, marks an incompatible change to the
 host/guest protocol (`REQUEST_VERSION`, the request `kb serve` reads) or to the database schema.

@@ -1,0 +1,38 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - python:3.13.5-bookworm@sha256:6c6b3c2deae72b980c4323738be824884c9a2e17588c93db82612f8a3072be88
+          - python:3.12.12-bookworm@sha256:c0abd0758831ad99b7a29e0c1a875da9c4abb9a2e3f21e2eeb585dbcadfb6cd0
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Install Git and SSH test tools
+        run: apt-get update -qq && apt-get install -y --no-install-recommends git openssh-client
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check release tag before tests
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 ci/check_release.py "$RELEASE_TAG"
+      - name: Install pinned test dependencies
+        run: python3 -m pip install -r requirements-ci.txt
+      - name: Run tests
+        run: python3 -m pytest tests -q -n auto --maxprocesses=8

@@ -622,8 +622,46 @@ def migrate_legacy(conn):
                      ' FROM %s' % table, (key,))
 
 
-def connect(busy_ms=10000):
-    conn = sqlite3.connect(db_path(), isolation_level=None)
+class BoardConnection(sqlite3.Connection):
+    """Keep the restore gate until SQLite closes, including on garbage collection."""
+    restore_gate = None
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            if self.restore_gate is not None:
+                self.restore_gate.close()
+                self.restore_gate = None
+
+
+def connect(busy_ms=10000, restoring=False):
+    path = os.path.realpath(db_path())
+    gate = None
+    if fcntl:
+        # Every writable connection participates, including hooks and migrations. SQLite's
+        # backup target cannot be inside a transaction, so it needs a separate barrier.
+        gate = open(path + '.restore.lock', 'a')
+        deadline = time.monotonic() + busy_ms / 1000
+        while True:
+            try:
+                fcntl.flock(gate, (fcntl.LOCK_EX if restoring else fcntl.LOCK_SH)
+                            | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    gate.close()
+                    raise sqlite3.OperationalError('timed out waiting for restore barrier')
+                time.sleep(0.01)
+    elif restoring:
+        raise Rejected('restore requires host file locking (fcntl)')
+    try:
+        conn = sqlite3.connect(path, isolation_level=None, factory=BoardConnection)
+    except BaseException:
+        if gate is not None:
+            gate.close()
+        raise
+    conn.restore_gate = gate
     conn.create_function('slabel', 3, session_label)
     conn.execute('PRAGMA busy_timeout=%d' % busy_ms)
     conn.execute('PRAGMA journal_mode=WAL')
@@ -2650,22 +2688,20 @@ def cmd_backup(args):
 
 
 def cmd_restore(args):
-    conn = connect()
+    conn = connect(restoring=True)
     _, name = session(conn, args)
     if not is_curator(name):
         raise Rejected('restore rejected: curator only')
     if not os.path.isfile(args.path):
         raise UsageError('no such backup file: %s' % args.path)
-    # Block claims first: one landing while the image is prepared would vanish in the copy.
-    with transaction(conn):
-        conn.execute("INSERT OR REPLACE INTO meta VALUES ('recovery', ?)", (now(),))
+    # The exclusive connection gate drains existing writers and keeps new ones outside
+    # until the replacement is complete. Failed validation must not enter recovery.
     src = sqlite3.connect('file:%s?mode=ro' % args.path, uri=True)
     try:
         if not 1 <= src.execute('PRAGMA user_version').fetchone()[0] <= SCHEMA_VERSION:
             raise UsageError('not a kb backup of schema version 1 to %d: %s'
                              % (SCHEMA_VERSION, args.path))
-        # Prepare the restored image in memory, then copy it in with one backup step,
-        # so no claim can land between the copy and the recovery flag.
+        # Prepare the restored image in memory under the exclusive restore gate.
         mem = sqlite3.connect(':memory:', isolation_level=None)
         src.backup(mem)
     except sqlite3.DatabaseError as e:
@@ -2695,8 +2731,17 @@ def cmd_restore(args):
     # The board stays this host's, also when the backup came from another host; its rows
     # keep their own installation values.
     mem.execute("INSERT OR REPLACE INTO meta VALUES ('installation', ?)", (live,))
+    fd, snapshot = tempfile.mkstemp(prefix=os.path.basename(db_path()) + '.pre-restore-',
+                                    suffix='.sqlite', dir=os.path.dirname(db_path()))
+    os.close(fd)
+    dest = sqlite3.connect(snapshot)
+    try:
+        conn.backup(dest)
+    finally:
+        dest.close()
     mem.backup(conn)
     mem.close()
+    print('pre-restore snapshot: %s' % snapshot)
     print('restored %s; claims and adds are blocked until kb recover --done' % args.path)
     for r in conn.execute("SELECT c.id, c.status, c.title, slabel(s.name, s.harness, s.token)"
                           " FROM ticket c"

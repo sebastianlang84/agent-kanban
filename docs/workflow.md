@@ -253,6 +253,11 @@ unanswered request (abandoned). A rejected command names the condition that fail
 the missing reply note or the session that may act. One that waits longer than `KB_STALE_HOURS`
 shows `waiting>24h`.
 
+Request hints are delivered once; also sweep `kb board --to <your-name>` and `kb board --to any`
+for unclaimed requests. Sub-sessions have their own names, so their hints cannot consume the
+main session's addressed requests. See [README limits](../README.md#limits) for restore locking,
+pre-restore snapshots and the host's advisory identity model.
+
 The schema-9 migration backfills open tickets from their latest close, force-close, or standard
 `abandoned`/`reopened`/`curator approved: ...` comment. Historical reopens with custom text
 cannot always be identified; their history must be checked manually. Future reopens record the

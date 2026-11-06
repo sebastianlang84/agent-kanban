@@ -201,9 +201,19 @@ git state.
 - Keep confidential content out of ticket titles; a board view or export may show titles to a
   wider audience. Notes are readable by everyone who can read the board file.
 - Never put secrets into tickets or notes. Never commit the database.
-- The curator identity is not authenticated on the host; `kb` assumes one person decides. Anyone
-  with a shell on the host can act as curator.
+- Host identities and name-based rights (`chief` and the configured approval orchestrator too)
+  guard against mistakes, not attacks. Agents share the OS account and can edit the database;
+  a local process can take a privileged name or clear its harness identity and act as curator.
 - One host serves one person's machines. A guest can take any session name except `curator`.
+
+On hosts with `fcntl`, restore takes an exclusive file lock shared by every writable connection,
+including hooks and migrations. It drains existing writers, keeps a private
+`<board>.pre-restore-*.sqlite` snapshot beside the board, then replaces the image; queued writers
+continue against the restored board. Adds and claims remain blocked until `kb recover --done`.
+Lock waits use the existing command/hook timeout; hooks retain their error-logging behavior.
+Restore is refused when host file locking is unavailable. Keep snapshots under the same backup
+policy as the board; restore does not automatically delete them. Older kb processes that predate
+this lock must be stopped before restoring.
 
 ## Development
 

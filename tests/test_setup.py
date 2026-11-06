@@ -119,7 +119,10 @@ class SetupTest(KbCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('| kb authorize --installation %s --label ' % inst, lines[0])
         self.assertTrue(lines[0].endswith(' -'))
-        self.assertEqual(sorted(os.listdir(host)), ['.config', '.ssh', 'bin', 'board.sqlite'])
+        files = ['.config', '.ssh', 'bin', 'board.sqlite']
+        if os.name != 'nt':  # native hosts use flock; Windows guests do not restore
+            files.append('board.sqlite.restore.lock')
+        self.assertEqual(sorted(os.listdir(host)), files)
         auth = read(os.path.join(host, '.ssh', 'authorized_keys'))
         blob = read(cfg['KB_SSH_KEY'] + '.pub').split()[1]
         self.assertIn('serve --installation %s",restrict ssh-ed25519 %s kb-guest-'

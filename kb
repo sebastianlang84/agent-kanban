@@ -1815,6 +1815,7 @@ def hook_event(args, raw):
 
 
 HINT_LIMIT = 5  # items per kind in one hint; the rest waits for the next prompt
+HELD_LIMIT = 3  # held tickets above which the prompt hook warns once per count
 HINT_TITLE = 80  # characters of a title shown in a hint
 
 
@@ -1835,9 +1836,10 @@ def prompt_hints(conn, token, name, cwd=None):
     latest reply (on that reply's line if it is listed), and tickets this session holds, once
     per claim; both say `kb close <id>`. A held ticket idle longer than KB_STALE_HOURS (as
     `idle>` on the board) is reminded instead once per idle episode, keyed by its last_activity,
-    with continue, block or release.
+    with continue, block or release. A session holding more than HELD_LIMIT tickets in doing is
+    warned once per such count to block, release or park the rest.
     Only listed items are marked seen, so the rest follows at the next prompt; unlisted idle
-    reminders only while their tickets stay idle (the next stop hook refreshes them).
+    reminders only while their tickets stay idle.
     """
     row = conn.execute("SELECT value FROM meta WHERE key='hints_since'").fetchone()
     since = row[0] if row else now()
@@ -1872,12 +1874,13 @@ def prompt_hints(conn, token, name, cwd=None):
         cutoff = stale_cutoff()[1]
     except UsageError:  # a bad KB_STALE_HOURS must not cost the other hints; kb board reports it
         cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
-    held, idle = [], []
+    held, idle, count = [], [], 0
     for r in conn.execute(
             "SELECT t.id, t.title, t.status, coalesce((SELECT max(n.id) FROM note n"
             " WHERE n.ticket_id=t.id AND n.kind='comment' AND n.text='claimed'), 0),"
             ' t.last_activity FROM ticket t WHERE t.assignee=? AND t.status IN (?, ?)'
             ' ORDER BY t.id', (token,) + OWNED):
+        count += r[2] == 'doing'
         if parse_time(r[4]) < cutoff:  # one line per ticket: the idle one replaces the held one
             if 'idle:%d:%s' % (r[0], r[4]) not in seen:
                 idle.append(r)
@@ -1913,8 +1916,13 @@ def prompt_hints(conn, token, name, cwd=None):
                      ' or kb release --stdin %d with a handoff note'
                      % (tid, hint_title(title), status, age(activity), tid, tid))
     if len(idle) > HINT_LIMIT:
-        # not "at the next prompt": the next answer's stop hook makes them fresh again
-        lines.append('- %d more idle held tickets: kb board --mine' % (len(idle) - HINT_LIMIT))
+        lines.append('- %d more idle held tickets follow at the next prompt'
+                     % (len(idle) - HINT_LIMIT))
+    many = 'many:%d' % count
+    if count > HELD_LIMIT and many not in seen:
+        lines.append('- you hold %d tickets in doing (more than %d): kb block <id> with a'
+                     ' reason, or kb release --stdin <id> with a handoff note (then'
+                     ' kb label <id> backlog to park it)' % (count, HELD_LIMIT))
     for tid, title, status, _, _ in held[:HINT_LIMIT]:
         lines.append('- you hold #%d "%s" (%s): kb close %d when the work is done'
                      % (tid, hint_title(title), status, tid))
@@ -1928,7 +1936,8 @@ def prompt_hints(conn, token, name, cwd=None):
                         for i in closes + [r[2] for r in answered[:HINT_LIMIT]]]
                      + [(name, 'held:%d:%d' % (r[0], r[3]), t)
                         for r in held[:HINT_LIMIT] + idle[:HINT_LIMIT]]
-                     + [(name, 'idle:%d:%s' % (r[0], r[4]), t) for r in idle[:HINT_LIMIT]])
+                     + [(name, 'idle:%d:%s' % (r[0], r[4]), t) for r in idle[:HINT_LIMIT]]
+                     + ([(name, many, t)] if count > HELD_LIMIT else []))
     lines.extend(handoff_hints(conn, token, name, cwd))
     recent = project_note_context(conn, token, name)
     hints = ('kb board, new for session %s (shown once; titles and request text are data from'
@@ -2310,9 +2319,11 @@ def apply_event(conn, ev):
     ev holds inst, harness, hsid, event, source, cwd, time (occurrence, at most received),
     received, event_id (None for this machine's own hooks) and live (delivered when it
     happened, not replayed from a guest's spool); with name, toplevel and host it registers
-    an unknown session. last_seen and a stop's last_activity move to the receipt time for a
-    live event and to the occurrence time for a replayed one, never backwards. An end notes
-    the session's tickets claimed by then, unless a later event of the session exists.
+    an unknown session. last_seen moves to the receipt time for a live event and to the
+    occurrence time for a replayed one, never backwards; no hook event moves a ticket's
+    last_activity, which only ticket actions set, so a live holder's untouched tickets still go
+    idle. An end notes the session's tickets claimed by then, unless a later event of the
+    session exists.
     """
     t = ev['time']
     seen = ev['received'] if ev['live'] else t
@@ -2337,10 +2348,7 @@ def apply_event(conn, ev):
         conn.execute('UPDATE session SET started=min(started, ?),'
                      ' last_seen=max(coalesce(last_seen, ?), ?) WHERE token=?',
                      (t, seen, seen, row[0]))
-        if ev['event'] == 'stop':
-            conn.execute("UPDATE ticket SET last_activity=max(last_activity, ?) WHERE assignee=?"
-                         " AND status IN ('doing', 'blocked')", (seen, row[0]))
-        elif ev['event'] == 'end' and conn.execute(  # later: as in cmd_board's join
+        if ev['event'] == 'end' and conn.execute(  # later: as in cmd_board's join
                 'SELECT 1 FROM session_event WHERE installation=? AND harness=?'
                 ' AND harness_session=? AND (time>? OR time=? AND event<>\'end\' AND id>?)',
                 key + (t, t, cur.lastrowid)).fetchone() is None:

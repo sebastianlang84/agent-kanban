@@ -167,7 +167,8 @@ the Windows-to-ssh path cannot corrupt a note.
 - No automatic claim expiry, and no release by other sessions: auto-expiry and release by "the next
   session" both hand a ticket to a second worker while the first may still be working. `kb board` flags
   a claim as stale; only the curator or the owner releases it.
-- Stale signals, all advisory: age of `last_activity` (any note or `kb touch`); a `session-ended` note
+- Stale signals, all advisory: age of `last_activity` (any note or `kb touch`, never a hook event,
+  so a live session's forgotten tickets still go idle); a `session-ended` note
   (D6); git state (D5).
 - Durability: daily backup of the database file (mechanism settled in P1). After a restore, `kb`
   refuses claims until the curator has reconciled every `doing` ticket.
@@ -321,9 +322,9 @@ they differ from the bullets above, they replace them.
   request line on the ssh stdin, not in the ssh command line, so no remote shell quotes them.
 - **Curator.** Also closed: a harness session on the host holding the curator's token no longer
   acts as curator.
-- **Time rule.** As written above, plus one addition: a replayed event moves `last_seen` and
-  `last_activity` only to its occurrence time, never backwards, so a session that was offline does
-  not look active on replay. A live event moves them to the receipt time.
+- **Time rule.** As written above, plus one addition: a replayed event moves `last_seen` only to
+  its occurrence time, never backwards, so a session that was offline does
+  not look active on replay. A live event moves it to the receipt time.
 - **Spool.** One file per event, written atomically, without a file lock (`fcntl` does not exist
   on Windows). Concurrent drains may send an event twice; the host dedupes by event id.
 - **Prompt hook.** Live only, never spooled. Accepted loss: a hint the host marked as seen before

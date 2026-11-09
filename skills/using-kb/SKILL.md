@@ -141,14 +141,15 @@ the approval can still be read again; a one-use reservation is not implemented.
 
 ## Board flags
 
-`idle>24h` (no activity), `waiting>24h` (todo, nobody claimed it), `session-ended` (owner ended
+`idle>24h` (no ticket action; answering does not count, so use notes or `kb touch <id>`), `waiting>24h` (todo, nobody claimed it), `session-ended` (owner ended
 without closing and did not resume), `answered`, `from:<session>`, `#<label>`, `worktree-gone`,
 `merged`, `git:unknown`. Flags are hints: only the owner or the curator releases a ticket; another
 session takes over a `session-ended` or `idle>` ticket only with `kb claim --take <id>`.
 
 ## Hooks
 
-Start, stop and end hooks (`kb hook start|stop|end --harness <h>`) record sessions and activity;
+Start, stop and end hooks (`kb hook start|stop|end --harness <h>`) record sessions, not ticket
+activity;
 the start hook also tells you your session name and the tickets of your repository you may take
 over.
 At the first prompt of each new session, `kb hook prompt` shows the last 24 hours of notes on its own
@@ -158,7 +159,8 @@ The prompt hook also adds a short "kb board, new for session …" list to your c
 requests addressed to you, replies to your requests, and reminders to `kb close <id>` your answered
 requests and the tickets you hold; a held ticket idle longer than `KB_STALE_HOURS` is reminded
 again, once per idle episode: continue it, `kb block` it with a reason, or `kb release --stdin` it
-with a handoff note. Act on it with `kb show <id>`; it appears once per session name,
+with a handoff note. Holding more than three tickets in `doing` draws a warning: block, release or
+park the rest. Act on it with `kb show <id>`; it appears once per session name,
 so a request you postpone stays visible only on `kb board --to <your name>`.
 Explicit handoffs also remind their addressee at prompts in the main checkout, once per release
 note and session token. Check `kb show`, then claim and verify what remains before closing.

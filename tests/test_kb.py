@@ -955,11 +955,12 @@ class HookTest(KbCase):
         conn.commit()
         conn.close()
         self.hook('stop', '--harness', 'claude', stdin=self.claude('Stop', stop_hook_active=False))
-        self.assertNotEqual(self.query('SELECT last_activity FROM ticket')[0][0],
-                            '2020-01-01T00:00:00Z')
+        # A stop shows the session alive but is no ticket activity: the ticket stays idle.
+        self.assertEqual(self.query('SELECT last_activity FROM ticket')[0][0],
+                         '2020-01-01T00:00:00Z')
         self.assertNotEqual(self.query('SELECT last_seen FROM session')[0][0],
                             '2020-01-01T00:00:00Z')
-        self.assertNotIn('idle>', self.board_line(ticket))
+        self.assertIn('idle>', self.board_line(ticket))
         self.hook('end', '--harness', 'claude', stdin=self.claude('SessionEnd', reason='other'))
         self.assertEqual(self.notes(ticket)[-1], ('session-ended', 'session ended'))
         self.assertIn('session-ended', self.board_line(ticket))
@@ -1405,7 +1406,22 @@ class PromptHintTest(KbCase):
         out = self.prompt()
         self.assertEqual(out.count('- you hold #'), 5)
         self.assertIn('1 more held tickets follow at the next prompt', out)
-        self.assertEqual(self.prompt().count('- you hold #'), 1)
+        self.assertIn('- you hold 6 tickets in doing (more than 3): kb block <id>', out)
+        out = self.prompt()
+        self.assertEqual(out.count('- you hold #'), 1)
+        self.assertNotIn('tickets in doing', out)  # once per count
+
+    def test_many_held_warning_counts_doing_only(self):
+        self.prompt()
+        env = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-1')
+        tids = [self.ok('add', '--claim', 'job %d' % i, '--new', env=env) for i in range(4)]
+        self.assertIn('- you hold 4 tickets in doing (more than 3): ', self.prompt())
+        self.assertEqual(self.prompt(), '')
+        self.ok('block', tids[0], env=env)
+        self.assertNotIn('tickets in doing', self.prompt())  # 3 in doing: no warning
+        self.ok('add', '--claim', 'job 4', '--new', env=env)
+        self.ok('add', '--claim', 'job 5', '--new', env=env)
+        self.assertIn('- you hold 5 tickets in doing ', self.prompt())
 
     def set_activity(self, tid, days):
         conn = sqlite3.connect(self.db)
@@ -1427,9 +1443,12 @@ class PromptHintTest(KbCase):
                       ' a reason, or kb release --stdin %s with a handoff note'
                       % (tid, tid, tid), out)
         self.assertEqual(self.prompt(), '')  # once per idle episode
-        # An answer (the stop hook) is new activity; a later idle period is a new episode.
+        # An answer (the stop hook) is no ticket activity: the ticket stays idle.
         payload = json.dumps(dict(session_id='cc-1', cwd=self.repo, hook_event_name='Stop'))
         self.kb('hook', 'stop', '--harness', 'claude', stdin=payload)
+        self.assertIn('idle>', self.board_line(tid))
+        # A ticket action is; a later idle period is a new episode.
+        self.ok('touch', tid, env=env)
         self.assertEqual(self.prompt(), '')
         self.set_activity(tid, 2)
         self.assertIn('- you hold #%s "build it" (doing), idle 2d: ' % tid, self.prompt())

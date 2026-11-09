@@ -11,7 +11,7 @@ skill [`skills/using-kb/SKILL.md`](../skills/using-kb/SKILL.md).
 | 1 | start hook | registers the session (harness, harness session id, folder, repository name) and tells it its name and the tickets of its repository it may take over | `kb hook start --harness <h>` |
 | 2 | agent | reads open and running tickets of the repository | `kb board --repo <repo>` |
 | 3 | agent | claims a matching ticket, or adds a new task that is claimed at once (a token session adds it as todo unless `--claim`) | `kb claim <id>` · `kb add "<goal>"` |
-| 4 | stop hook | after every answer, sets `last_activity` of the session's open tickets | `kb hook stop --harness <h>` |
+| 4 | stop hook | after every answer, sets the session's `last_seen`; it leaves `last_activity` of its tickets alone, which only ticket actions set (note, `kb touch`, claim, block, resume, close) | `kb hook stop --harness <h>` |
 | 5 | agent | closes the ticket with the three closing lines | `kb close <id> --where … --changed … --open …` (or the lines on stdin) |
 | 6 | end hook | writes a `session-ended` note on tickets the session left open | `kb hook end --harness <h>` |
 | 7 | curator | reads the board and its flags | `kb board` · `kb show <id>` |
@@ -22,7 +22,8 @@ context (see Hooks).
 
 Nothing releases a ticket automatically. A held ticket whose session ended shows
 `session-ended` until a start or stop of that session follows (Claude `--resume` keeps the
-session id); one without activity for `KB_STALE_HOURS` shows `idle>24h`. With either flag
+session id); one without a ticket action for `KB_STALE_HOURS` shows `idle>24h`, even while its
+session is alive. A session that keeps working on a ticket without notes runs `kb touch <id>`. With either flag
 another session may take it over: `kb claim --take <id>` (an `event` note records it). Without a
 flag, ask the holder with a request, or the curator to release it.
 
@@ -150,9 +151,10 @@ requests a session of this name opened that are `answered` and still open, once 
 and about tickets the session holds, once per claim. A held ticket whose `last_activity` is
 older than `KB_STALE_HOURS` (the board's `idle>` flag) gets, instead, a reminder to continue it,
 `kb block` it or `kb release --stdin` it with a handoff note, once per idle episode (each new
-`last_activity`); ownership never changes. At most five of each kind are listed; the
-rest follow at the next prompt, except idle reminders: the rest are listed by `kb board --mine`
-and come back only while those tickets stay idle. Titles are cut to one line of 80 characters. Only requests and
+`last_activity`); ownership never changes. A session with more than three tickets in `doing` is
+warned once per such count to block, release (and park with `kb label <id> backlog`) the rest.
+At most five of each kind are listed; the rest follow at the next prompt (idle reminders only
+while those tickets stay idle). Titles are cut to one line of 80 characters. Only requests and
 replies after the schema v4 migration (or after the import of a beelink board) are hinted, and
 only for a session the start hook has registered. Claude Code and codex add the printed text as context; the pi
 extension returns it as a message. Errors go to `hook-errors.log` in the directory of `KB_DB`
@@ -314,7 +316,7 @@ is still ended.
 
 | Flag | Meaning |
 |---|---|
-| `idle>24h` | no activity on the ticket for `KB_STALE_HOURS` (default 24) |
+| `idle>24h` | no ticket action (note, `kb touch`, claim, block, resume) for `KB_STALE_HOURS` (default 24); the stop hook does not count |
 | `waiting>24h` | a todo ticket nobody has claimed for `KB_STALE_HOURS` |
 | `from:<session>` | the session that opened a request |
 | `answered` | a request has a reply but is not closed yet |

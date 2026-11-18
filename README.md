@@ -19,7 +19,9 @@ ownership. Guest machines use the same commands over SSH, without an application
 
 Tasks move through `todo`, `doing`, `blocked`, `done`, and `abandoned`. Requests carry an
 addressee and a recorded reply. Session tokens identify scripts; hooks discover supported
-harness identities and record start, stop, and end events. The shipped
+harness identities and record start, stop, and end events. Hooks show a session new requests
+at its next prompt; a new session also sees open requests to its name that an earlier session
+left unanswered. The shipped
 [using-kb skill](skills/using-kb/SKILL.md) explains the workflow to agents.
 
 ## Requirements

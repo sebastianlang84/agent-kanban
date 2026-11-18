@@ -1524,6 +1524,59 @@ class PromptHintTest(KbCase):
         # A session of another name is not addressed.
         self.assertEqual(self.prompt(hsid='cc-3', cwd=self.tmp), '')
 
+    def test_new_session_start_lists_open_requests_its_name_passed_over(self):
+        tid = self.ok('add', '--type', 'request', '--to', 'alpha', 'check X', '--session',
+                      self.other)
+        self.assertIn('request #%s' % tid, self.prompt(hsid='cc-1'))  # seen, not answered
+        start = lambda hsid: context(self.kb('hook', 'start', '--harness', 'claude', stdin=json.dumps(
+            dict(session_id=hsid, cwd=self.repo, source='startup',
+                 hook_event_name='SessionStart'))).stdout)
+        out = start('cc-2')  # cc-1 is still live, so cc-2 is a sub-session: not its request
+        self.assertNotIn('#%s' % tid, out)
+        end = json.dumps(dict(session_id='cc-1', cwd=self.repo, hook_event_name='SessionEnd'))
+        self.kb('hook', 'end', '--harness', 'claude', stdin=end)
+        out = start('cc-3')
+        self.assertRegex(out, r'open request #%s "check X" from beta\S*, waiting' % tid)
+        self.assertEqual(self.prompt(hsid='cc-3', start=False), '')  # the prompt adds nothing
+        self.ok('claim', tid, env=dict(self.env, CLAUDE_CODE_SESSION_ID='cc-3'), cwd=self.repo)
+        self.kb('hook', 'end', '--harness', 'claude', stdin=end.replace('cc-1', 'cc-3'))
+        self.assertNotIn('#%s' % tid, start('cc-4'))  # claimed: no longer open
+        # Released unanswered while cc-4 runs: cc-4 never got it, so its resume lists it.
+        self.ok('release', tid, '--why', 'handoff', env=dict(self.env, CLAUDE_CODE_SESSION_ID='cc-3'),
+                cwd=self.repo)
+        resume = lambda hsid: context(self.kb('hook', 'start', '--harness', 'claude', stdin=json.dumps(
+            dict(session_id=hsid, cwd=self.repo, source='resume',
+                 hook_event_name='SessionStart'))).stdout)
+        self.assertIn('open request #%s' % tid, resume('cc-4'))
+        self.assertNotIn('#%s' % tid, resume('cc-4'))  # listed once per session
+        cc4 = dict(self.env, CLAUDE_CODE_SESSION_ID='cc-4')
+        self.ok('claim', tid, env=cc4, cwd=self.repo)
+        # Answered, then released: the reply waits for the opener, not for another answer.
+        self.ok('note', '--reply', tid, 'done', env=cc4, cwd=self.repo)
+        self.ok('release', tid, '--why', 'handoff', env=cc4, cwd=self.repo)
+        self.kb('hook', 'end', '--harness', 'claude', stdin=end.replace('cc-1', 'cc-4'))
+        self.assertNotIn('#%s' % tid, start('cc-5'))
+        # A resumed session was hinted itself: no replay on resume.
+        other = self.ok('add', '--type', 'request', '--to', 'alpha', 'check Y', '--new', '--session',
+                        self.other)
+        self.assertIn('request #%s' % other, self.prompt(hsid='cc-5', start=False))
+        self.kb('hook', 'end', '--harness', 'claude', stdin=end.replace('cc-1', 'cc-5'))
+        self.assertIn('open request #%s' % other, start('cc-6'))  # cc-5 left it
+        self.assertNotIn('#%s' % other, resume('cc-6'))
+
+    def test_request_to_a_name_not_seen_lately_says_it_waits(self):
+        self.prompt(hsid='cc-1')
+        self.env['KB_STALE_HOURS'] = '0.001'
+        time.sleep(5.5)  # times have one-second resolution
+        r = self.kb('add', '--type', 'request', '--to', 'alpha', 'later', '--session',
+                    self.other)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('no session named alpha was seen for', r.stderr)
+        self.assertIn('at its next prompt or start', r.stderr)
+        self.env['KB_STALE_HOURS'] = '24'
+        r = self.kb('add', '--type', 'request', '--to', 'alpha', 'now', '--session', self.other)
+        self.assertEqual(r.stderr, '')
+
     def test_sub_session_neither_sees_nor_claims_the_main_sessions_request(self):
         # A sub-session that a main session starts in the same repository must neither see
         # nor claim requests addressed to the repository name.

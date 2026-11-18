@@ -284,6 +284,14 @@ def stale_cutoff():
         raise UsageError('KB_STALE_HOURS must be a number of hours')
 
 
+def stale_cutoff_or_default():
+    """stale_cutoff()'s time; 24 hours when KB_STALE_HOURS is bad (kb board reports that)."""
+    try:
+        return stale_cutoff()[1]
+    except UsageError:
+        return datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
+
+
 def age(s):
     if not s:
         return '-'
@@ -1388,11 +1396,18 @@ def cmd_add(args):
         elif text:
             add_note(conn, ticket_id, me, 'comment', text)
     print(ticket_id)
-    if args.to not in (None, 'any', CURATOR) and conn.execute(
-            'SELECT 1 FROM session WHERE name=?', (args.to,)).fetchone() is None:
+    if args.to in (None, 'any', CURATOR):
+        return
+    seen = conn.execute('SELECT max(coalesce(last_seen, started)) FROM session WHERE name=?',
+                        (args.to,)).fetchone()[0]
+    if seen is None:
         known = [n['name'] for n in session_names(conn, KNOWN_DAYS)][:KNOWN_MAX]
         sys.stderr.write('kb: no session currently has the name %s; known names: %s\n'
                          % (args.to, ', '.join(known) or '-'))
+    elif parse_time(seen) < stale_cutoff_or_default():
+        # The request is listed to the next session of that name; until then nobody sees it.
+        sys.stderr.write('kb: no session named %s was seen for %s; it sees the request at its'
+                         ' next prompt or start\n' % (args.to, age(seen)))
 
 
 def holder_gone(conn, ticket_id):
@@ -2073,10 +2088,7 @@ def prompt_hints(conn, token, name, cwd=None):
         (name,)) if 'answered:%d' % r[2] not in seen]
     latest = {r[0]: r[2] for r in answered}
     # A claim is its 'claimed' note (as in cmd_report); a task claimed by kb add has none (0).
-    try:
-        cutoff = stale_cutoff()[1]
-    except UsageError:  # a bad KB_STALE_HOURS must not cost the other hints; kb board reports it
-        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
+    cutoff = stale_cutoff_or_default()  # a bad KB_STALE_HOURS must not cost the other hints
     held, idle, count = [], [], 0
     for r in conn.execute(
             "SELECT t.id, t.title, t.status, coalesce((SELECT max(n.id) FROM note n"
@@ -2544,8 +2556,9 @@ def emit(args, event, text):
 def start_context(conn, token, name, base=None):
     """Inside a write transaction: what a new session should know about the board.
 
-    Its name (and, for a sub-session, the main session's name base), and tickets of its
-    repository whose holder ended or went idle, which it may take over with kb claim --take.
+    Its name (and, for a sub-session, the main session's name base), open requests to its
+    name that an earlier session of the name passed over, and tickets of its repository whose holder ended or went idle, which it may
+    take over with kb claim --take.
     The prompt hints follow at the first prompt.
     """
     lines = ['kb: this session is `%s` on the shared board (`kb board`); requests and'
@@ -2553,6 +2566,26 @@ def start_context(conn, token, name, base=None):
     if base and name != base:
         lines.append('kb: a live session already holds `%s`, so this one is a sub-session;'
                      ' requests to `%s` belong to that main session, not to you.' % (base, base))
+    # Open requests to this name that an earlier session of the name was already hinted: a
+    # prompt hint goes out once per name, so a request it passed over would reach no later
+    # session. Requests not hinted yet follow at the first prompt, as before. Each is listed
+    # once per session token (start:<id>), so a resume does not repeat it; answered ones wait
+    # for the opener.
+    asked = conn.execute(
+        "SELECT t.id, t.title, slabel(s.name, s.harness, s.token), t.created FROM ticket t"
+        " JOIN session s ON s.token=t.opener JOIN hint_seen h ON h.name=t.addressee"
+        " AND h.item='ticket:' || t.id WHERE t.type='request' AND t.status='todo'"
+        " AND t.assignee IS NULL AND t.addressee=? AND t.opener<>? AND NOT EXISTS (SELECT 1"
+        " FROM note r WHERE r.ticket_id=t.id AND r.kind='reply' AND r.id>t.reopened)"
+        " AND NOT EXISTS (SELECT 1 FROM hint_seen d WHERE d.name=? AND d.item='start:' || t.id)"
+        " ORDER BY t.id", (name, token, token)).fetchall()
+    conn.executemany('INSERT OR IGNORE INTO hint_seen (name, item, time) VALUES (?, ?, ?)',
+                     [(token, 'start:%d' % r[0], now()) for r in asked[:HINT_LIMIT]])
+    for tid, title, opener, created in asked[:HINT_LIMIT]:
+        lines.append('- open request #%d "%s" from %s, waiting %s: kb show %d, then kb claim %d'
+                     ' to answer' % (tid, hint_title(title), opener, age(created), tid, tid))
+    if len(asked) > HINT_LIMIT:
+        lines.append('- %d more open requests to %s: kb board' % (len(asked) - HINT_LIMIT, name))
     repo = conn.execute('SELECT worktree FROM session WHERE token=?', (token,)).fetchone()
     repo = repo_name(repo[0]) if repo and repo[0] and not GUEST else ''
     if repo:

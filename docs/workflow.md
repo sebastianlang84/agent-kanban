@@ -8,7 +8,7 @@ skill [`skills/using-kb/SKILL.md`](../skills/using-kb/SKILL.md).
 
 | # | Who | What | Command |
 |---|---|---|---|
-| 1 | start hook | registers the session (harness, harness session id, folder, repository name) and tells it its name and the tickets of its repository it may take over | `kb hook start --harness <h>` |
+| 1 | start hook | registers the session (harness, harness session id, folder, repository name) and tells it its name, open requests to that name an earlier session left, and the tickets of its repository it may take over | `kb hook start --harness <h>` |
 | 2 | agent | reads open and running tickets of the repository | `kb board --repo <repo>` |
 | 3 | agent | claims a matching ticket, or adds a new task that is claimed at once (a token session adds it as todo unless `--claim`) | `kb claim <id>` · `kb add "<goal>"` |
 | 4 | stop hook | after every answer, sets the session's `last_seen`; it leaves `last_activity` of its tickets alone, which only ticket actions set (note, `kb touch`, claim, block, resume, close) | `kb hook stop --harness <h>` |
@@ -121,7 +121,8 @@ session tokens of its own installation.
 `kb whoami` prints the calling session's name, label, harness, installation and repository without
 registering it; `kb sessions` lists the session names seen in the last 14 days or holding a
 doing or blocked ticket (`--all`: every name). `kb add --type request --to <name>` warns on
-stderr when no session currently has that name.
+stderr when no session currently has that name, and says when no session of that name was seen
+within `KB_STALE_HOURS` (it sees the request at its next prompt or start).
 
 A script, or another machine over plain ssh, runs `kb start --as <name>` once and passes the
 printed token as `--session <token>` (before or after the command, or as `KB_SESSION`) on every
@@ -174,8 +175,12 @@ count while `echo "git push"`, `git commit-tree`, `git merge-base` and `docker c
 do not. Not seen: commands inside `bash -c`, `eval` or an alias. pi has no guard hook.
 
 Hooks always exit 0; only the start, prompt and guard hooks print. The start hook names the
-session (`kb: this session is <name> ...`) and lists held tickets of its repository whose holder
-ended or went idle, with `kb claim --take <id>`. Start and prompt output is
+session (`kb: this session is <name> ...`), lists open unclaimed requests to that name that an
+earlier session of the name was already hinted but left without a reply (`open request #N ...
+waiting <age>`, at most five; prompt hints go out once per name, so these would otherwise reach no
+later session; each once per session, so a resume does not repeat it),
+and lists held tickets of its repository whose holder ended or went idle, with
+`kb claim --take <id>`. Start and prompt output is
 `hookSpecificOutput.additionalContext` JSON for Claude Code and codex, plain text for pi or with
 `--format text`. `KB=0` or `BRAIN_SESSION_CONTEXT=0` turns all hooks off for automated runs.
 Each live host or guest start (not a replayed spool event) also returns idle `doing` tickets to

@@ -114,22 +114,11 @@ It is not the executable to install for a new board.
 
 The scripts in [tools/](tools/) support local automation; setup does not install or launch them.
 
-- `kb-watch` streams new notes for a session, with optional `--exec` handling. It uses `KB_DB`,
-  defaults to the standard board path, and stores its cursor beside the database. Linux inotify
-  wakes it on writes; other environments fall back to polling.
+- `kb-watch` streams new notes for a session, with optional `--exec` handling. It finds the
+  database as `kb` does (`KB_DB` from the environment or the config file, else the default path)
+  and stores its cursor beside it. Linux inotify wakes it on writes; other environments fall back
+  to polling. It runs on the host only; a guest runs it there over ssh.
 - `autopilot` routes stalled work into requests. Preview with `tools/autopilot --dry-run`.
-- `kb-agent-concierge` handles one note through headless Claude Code. Supply project instructions
-  and `permissions.json` under `~/.config/agent-kanban/concierge` before using it. It has retry
-  and daily budgets and escalates through curator requests.
-- `kb-concierge` restricts commands for that agent. `kb-remote` is a separate token-based SSH
-  gateway; the installation-scoped guest protocol above is the normal multi-machine setup.
-- `hup-guard` stops a command when its SSH client disconnects.
-
-The concierge and remote helpers use this checkout's CLI by default; `KB_BIN` overrides it.
-`KB_STATE_DIR` overrides their token/log directory. Concierge defaults to the database directory;
-`kb-remote` defaults to `~/.local/share/agent-kanban`. `KB_CONCIERGE_DIR` selects the agent's
-project directory and `KB_CLAUDE_BIN` selects its executable (default `claude` on `PATH`).
-These helper settings are environment variables; set `KB_DB` explicitly for a non-default board.
 
 ## Status and limitations
 

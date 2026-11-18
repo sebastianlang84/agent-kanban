@@ -14,15 +14,15 @@ Each new note prints one line: `kb #<ticket> <author> <kind>: <title>`.
 With --exec CMD the script also runs CMD (a failing CMD is retried on the next poll) with KB_TICKET, KB_NOTE, KB_AUTHOR, KB_KIND and KB_TITLE in the
 environment (for example a script that wakes an agent session).
 
-The last seen note id is kept per name beside the database as watch-<name>.last, so a restart does
-not repeat old notes. The first run starts at the newest note.
+The database is selected as in kb: KB_DB from the environment or from
+$XDG_CONFIG_HOME/agent-kanban/config (default ~/.config/agent-kanban/config), then
+~/.local/share/agent-kanban/board.sqlite. The last seen note id is kept per name in
+watch-<name>.last beside the database. The first run starts at the newest note.
 
 Usage: kb-watch --for NAME [--interval 0] [--once | --until-first] [--exec CMD]
 """
-import argparse, ctypes, json, os, select, sqlite3, stat, struct, subprocess, sys, time
+import argparse, ctypes, json, os, runpy, select, sqlite3, stat, struct, subprocess, sys, time
 from pathlib import Path
-
-DB = Path(os.environ.get("KB_DB") or Path.home() / ".local/share/agent-kanban/board.sqlite").expanduser()
 
 QUERY = """
 SELECT n.id, n.ticket_id, author.name, n.kind, t.title
@@ -45,10 +45,11 @@ IN_MODIFY, IN_CLOSE_WRITE, IN_MOVED_TO, IN_CREATE = 0x2, 0x8, 0x80, 0x100
 
 
 class Waiter:
-    """Blocks until a kb.sqlite* file in the database directory changes, or the timeout ends."""
+    """Blocks until the database or one of its sidecar files changes, or the timeout ends."""
 
-    def __init__(self, directory: Path):
+    def __init__(self, db: Path):
         self.fd = -1
+        self.db_name = os.fsencode(db.name)
         # Started over ssh without a tty, stdout is the session pipe. When the client goes away,
         # sshd closes its end and poll() reports POLLERR/POLLHUP on stdout; exit then instead of
         # lingering (sshd sends no SIGHUP without a tty). stdin is not used: it may be EOF at once.
@@ -58,7 +59,7 @@ class Waiter:
             libc = ctypes.CDLL(None, use_errno=True)
             fd = libc.inotify_init1(os.O_CLOEXEC)
             mask = IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE
-            if fd >= 0 and libc.inotify_add_watch(fd, str(directory).encode(), mask) >= 0:
+            if fd >= 0 and libc.inotify_add_watch(fd, os.fsencode(db.parent), mask) >= 0:
                 self.fd = fd
         except (OSError, AttributeError):
             pass
@@ -86,7 +87,7 @@ class Waiter:
             while off < len(buf):
                 _, _, _, length = struct.unpack_from("iIII", buf, off)
                 name = buf[off + 16:off + 16 + length].rstrip(b"\0")
-                hit = hit or name.startswith(DB.name.encode())
+                hit = hit or name.startswith(self.db_name)
                 off += 16 + length
             if hit:
                 time.sleep(0.2)  # let the writer finish its transaction
@@ -107,8 +108,11 @@ def main() -> int:
     p.add_argument("--ignore-author", default="", help="comma-separated authors whose notes are skipped")
     a = p.parse_args()
 
-    state = DB.parent / f"watch-{a.name}.last"
-    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+    kb = runpy.run_path(str(Path(__file__).resolve().parents[1] / "kb"))
+    db = Path(kb["board_file"]())
+    uri = db.as_uri() + "?mode=ro"
+    state = db.parent / f"watch-{a.name}.last"
+    conn = sqlite3.connect(uri, uri=True, timeout=10)
     def position():
         meta = dict(conn.execute("SELECT key, value FROM meta WHERE key IN"
                                  " ('restore_generation', 'restore_note_id')"))
@@ -140,14 +144,14 @@ def main() -> int:
 
     also = json.dumps([n for n in a.also_to.split(",") if n])
     ignore = json.dumps([n for n in a.ignore_author.split(",") if n])
-    waiter = Waiter(DB.parent)
-    inode = DB.stat().st_ino
+    waiter = Waiter(db)
+    inode = db.stat().st_ino
     while True:
         failed = False
-        if DB.stat().st_ino != inode:
+        if db.stat().st_ino != inode:
             conn.close()
-            conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
-            inode = DB.stat().st_ino
+            conn = sqlite3.connect(uri, uri=True, timeout=10)
+            inode = db.stat().st_ino
         conn.execute("BEGIN")
         current_generation, baseline = position()
         if current_generation != generation:

@@ -68,7 +68,7 @@ owns or noted on still come through.
 
 - **Harnesses with a background monitor:** run the listener with the available monitor or
   background-process tool:
-  `ssh -o ServerAliveInterval=30 <host> '~/.local/bin/kb-watch --for <name> --no-any' 2>&1`.
+  `ssh -o ServerAliveInterval=30 <host> '<repo>/tools/kb-watch --for <name> --no-any' 2>&1`.
   Each new note arrives as an event; read the ticket with `kb show <id>` before acting. Restart
   the listener whenever its monitoring window expires, for as long as the session is open.
 - **Harnesses without a monitor:** do the catch-up above at session start and whenever the user

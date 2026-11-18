@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Route stalled kb tickets through requests; never change the listed tickets."""
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import re
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+
+IDENTITY_ENV = ('CLAUDE_CODE_SESSION_ID', 'CODEX_SESSION_ID', 'PI_SESSION_ID',
+                'PI_SUBAGENT_DEPTH', 'KB_SESSION', 'CODEX_THREAD_ID', 'KB_HARNESS')
+OPEN = ('todo', 'doing', 'blocked')
+ACTIVE_DAYS = 14  # an owner seen within this many days has a session (kb KNOWN_DAYS)
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def cutoff():
+    try:
+        hours = float(os.environ.get('KB_STALE_HOURS') or 24)
+        if hours < 0:
+            raise ValueError()
+        return now() - datetime.timedelta(hours=hours)
+    except (ValueError, OverflowError):
+        raise ValueError('KB_STALE_HOURS must be a number of hours')
+
+
+def owner(ticket, names=()):
+    name = (ticket['to'] if ticket['type'] == 'request'
+            else ticket['repo'] or ticket['to'])
+    if not name or name == 'any':
+        return None
+    if name in names:  # raw names may themselves contain a display-like suffix
+        return name
+    label = re.fullmatch(r'(.*)·[0-9a-f]{4}', name)
+    if label:
+        name = label.group(1)
+        if name in names:
+            return name
+    name = name.rsplit('/', 1)[0]
+    return None if name in ('', 'any') else name
+
+
+def save(path, state):
+    """Replace the state with a complete, private file in the same directory."""
+    fd, temporary = tempfile.mkstemp(prefix=path.name + '.', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(state, stream)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+class Board:
+    def __init__(self, token):
+        self.token = token
+        self.env = {k: v for k, v in os.environ.items() if k not in IDENTITY_ENV}
+        self.bin = os.environ.get('KB_BIN') or str(Path(__file__).resolve().parent.parent / 'kb')
+
+    def call(self, *args, body=None):
+        argv = [self.bin] + list(args)
+        if self.token:
+            argv += ['--session', self.token]
+        result = subprocess.run(argv, input=body, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, universal_newlines=True, env=self.env)
+        if result.returncode:
+            raise RuntimeError('kb %s failed (exit %d): %s' %
+                               (args[0], result.returncode, result.stderr.strip()))
+        return result.stdout.strip()
+
+
+def body_for(tickets, curator, names=()):
+    lines = [('Stalled tickets that need a curator decision or have no active owner.' if curator
+              else 'Stalled tickets you own: continue, release with a handoff, or close each; '
+                   'reply here when done. The autopilot never closes this request.')]
+    for ticket in tickets:
+        lines.append('- #%d %s %s %s owner:%s last activity %s %s; kb show %d' % (
+            ticket['id'], ticket['type'], ticket['status'],
+            json.dumps(ticket['title'], ensure_ascii=False),
+            owner(ticket, names) or '-', ticket['last_activity'], ' '.join(ticket['flags']),
+            ticket['id']))
+    return '\n'.join(lines) + '\n'
+
+
+def run(args, path):
+    state = json.loads(path.read_text()) if path.exists() else {'token': None, 'reported': {}}
+    board = Board(state.get('token'))
+    stale_before = cutoff()
+    if not board.token and not args.dry_run:
+        board.token = board.call('start', '--as', args.name, '--harness', 'cli')
+        state['token'] = board.token
+        save(path, state)
+    tickets = json.loads(board.call('board', '--json'))
+    stranded = {t['id'] for t in json.loads(board.call('board', '--stranded', '--json'))}
+    # kb sessions also lists names that only hold a ticket; a dormant holder has no session.
+    active = (now() - datetime.timedelta(days=ACTIVE_DAYS)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    sessions = json.loads(board.call('sessions', '--all', '--json'))
+    known_names = {s['name'] for s in sessions}
+    names = {s['name'] for s in sessions if s['seen'] >= active}
+    reported = state['reported']
+    open_ids = {str(t['id']) for t in tickets}
+    state['reported'] = reported = {k: v for k, v in reported.items() if k in open_ids}
+    existing = {}
+    for ticket in sorted(tickets, key=lambda t: t['id']):
+        # A request whose holder ended or went silent (--stranded) takes no more items.
+        if (ticket['type'] == 'request' and ticket['opener_name'] == args.name
+                and ticket['status'] in OPEN and ticket['id'] not in stranded):
+            existing.setdefault(ticket['to'], ticket['id'])
+    groups = {}
+    stalled = 0
+    for ticket in tickets:
+        # Its own requests are never escalated, except one whose holder ended or went silent:
+        # that one is reported once as an item, so the tickets it lists are not lost.
+        if ticket['opener_name'] == args.name and ticket['id'] not in stranded:
+            continue
+        old = datetime.datetime.strptime(ticket['last_activity'], '%Y-%m-%dT%H:%M:%SZ')
+        old = old.replace(tzinfo=datetime.timezone.utc) < stale_before
+        # Unclaimed: stalled only after KB_STALE_HOURS without activity, handoffs included.
+        # Held: idle that long, or listed by --stranded (ended past its grace, or silent).
+        waiting = ticket['status'] == 'todo' and ticket['assignee'] is None and old
+        held = ticket['status'] in ('doing', 'blocked') and (old or ticket['id'] in stranded)
+        if not (waiting or held):
+            continue
+        stalled += 1
+        if reported.get(str(ticket['id'])) == ticket['last_activity']:
+            continue
+        to = owner(ticket, known_names)
+        if (set(ticket['labels']) & {'approval', 'needs-curator', 'decision'} or to == 'curator'
+                or not to or to not in names):
+            to = 'curator'
+        elif to == args.name:
+            continue
+        groups.setdefault(to, []).append(ticket)
+    added = noted = count = 0
+    for to, items in groups.items():
+        text = body_for(items, to == 'curator', known_names)
+        if to in existing:
+            command = ['note', str(existing[to]), '--kind', 'comment']
+        else:
+            title = ('Curator: open decisions and owner-less stalled tickets' if to == 'curator'
+                     else 'Stalled tickets for ' + to)
+            command = ['add', '--new', '--type', 'request', '--to', to, '--stdin']
+            if to == 'curator':
+                command += ['--label', 'needs-curator']
+            command += [title]
+        if args.dry_run:
+            print(json.dumps({'command': command, 'stdin': text}))
+        else:
+            board.call(*command, body=text)
+            for ticket in items:
+                reported[str(ticket['id'])] = ticket['last_activity']
+            save(path, state)
+        added += command[0] == 'add'
+        noted += command[0] == 'note'
+        count += len(items)
+    if not args.dry_run:
+        save(path, state)
+    print('%s stalled=%d newly_reported=%d requests_added=%d notes_added=%d' % (
+        now().strftime('%Y-%m-%dT%H:%M:%SZ'), stalled, count, added, noted))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--name', default='autopilot', help='session name (default: autopilot)')
+    default = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state')
+    parser.add_argument('--state', default=str(default / 'agent-kanban/autopilot.json'))
+    parser.add_argument('--dry-run', action='store_true', help='print planned writes only')
+    args = parser.parse_args()
+    path = Path(args.state).expanduser()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(path) + '.lock', 'a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print('autopilot: lock held; another pass is running')
+                return 0
+            run(args, path)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+        print('autopilot: %s' % error, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

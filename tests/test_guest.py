@@ -591,6 +591,46 @@ def iso(offset=0):
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + offset))
 
 
+class GuestCommitBindingTest(GuestCase):
+    """kb 901: a guest binds approvals to its own worktree; the host never files them unbound."""
+    def git(self, *args):
+        return subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@t'] + list(args),
+                              check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              universal_newlines=True).stdout.strip()
+
+    def test_guest_resolves_its_code_state(self):
+        repo = os.path.join(self.tmp, 'guestrepo')
+        self.git('init', '-q', repo)
+        self.git('-C', repo, 'commit', '-q', '--allow-empty', '-m', 'one')
+        head = self.git('-C', repo, 'rev-parse', 'HEAD')
+        g = self.make_guest('laptop')
+        opener = self.ok('start', '--as', 'opener', env=g)
+        # A comma-joined label still counts as an approval on the guest.
+        tid = self.ok('add', 'push', '--type', 'request', '--to', 'curator', '--label',
+                      'approval,merge', '--session', opener, '--note', 'git push', env=g, cwd=repo)
+        self.assertEqual(self.query('SELECT commit_sha FROM ticket WHERE id=?', tid), [(head,)])
+        symbolic = self.ok('add', 'push older', '--new', '--type', 'request', '--to', 'curator',
+                           '--label', 'approval', '--commit', 'HEAD', '--session', opener,
+                           env=g, cwd=repo)
+        self.assertEqual(self.query('SELECT commit_sha FROM ticket WHERE id=?', symbolic), [(head,)])
+        rev = self.ok('show', tid).splitlines()[0].split(': ')[1]
+        self.assertEqual(self.kb('approve', tid, '--rev', rev, '--stdin', '--session', self.curator,
+                                 stdin='ok').returncode, 0)
+        self.assertEqual(self.ok('approval', tid, env=g, cwd=repo), 'ok')
+        self.git('-C', repo, 'commit', '-q', '--allow-empty', '-m', 'two')
+        self.assertEqual(self.code('approval', tid, env=g, cwd=repo), 1)
+        if os.geteuid() != 0:  # an unreadable file makes the guest's code state unknown
+            locked = os.path.join(repo, 'locked')
+            with open(locked, 'w') as f:
+                f.write('x')
+            os.chmod(locked, 0)
+            r = self.kb('add', 'push locked', '--new', '--type', 'request', '--to', 'curator',
+                        '--label', 'approval', '--session', opener, env=g, cwd=repo)
+            os.remove(locked)
+            self.assertEqual(r.returncode, 3, r.stderr)
+            self.assertIn('cannot record the uncommitted code state', r.stderr)
+
+
 class GuestHookTest(GuestCase):
     """Hooks on a guest: deadline, spool, replay and kb hook ingest."""
 
@@ -1263,14 +1303,14 @@ class MigrationV5Test(KbCase):
         tables = ('session', 'ticket', 'note', 'session_event', 'hint_seen')
         before = [self.query('SELECT * FROM %s ORDER BY 1' % t) for t in tables]
         self.assertIn('old', self.ok('board'))
-        self.assertEqual(self.query('PRAGMA user_version'), [(10,)])
+        self.assertEqual(self.query('PRAGMA user_version'), [(11,)])
         conf = os.path.join(self.home, '.config', 'agent-kanban', 'config')
         with open(conf) as f:
             inst = f.read().strip().split('=', 1)[1]
         self.assertRegex(inst, r'^[0-9a-f]{16}$')
         after = [self.query('SELECT * FROM %s ORDER BY 1' % t) for t in tables]
         self.assertEqual(after[0], [r + (inst, '') for r in before[0]])
-        self.assertEqual([r[:-2] for r in after[1]], before[1])
+        self.assertEqual([r[:-3] for r in after[1]], before[1])
         self.assertEqual(after[2], before[2])
         self.assertEqual(after[3], [r + (inst, None, None) for r in before[3]])
         self.assertEqual(self.query("SELECT value FROM meta WHERE key='installation'"),

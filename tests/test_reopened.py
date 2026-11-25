@@ -101,6 +101,7 @@ class ReopenedRequestTest(KbCase):
                 last = conn.execute('SELECT max(id) FROM note').fetchone()[0]
             tickets.append((tid, last))
         with sqlite3.connect(self.db) as conn:
+            conn.execute('ALTER TABLE ticket DROP COLUMN commit_sha')
             conn.execute('ALTER TABLE ticket DROP COLUMN target')
             conn.execute('ALTER TABLE ticket DROP COLUMN reopened')
             conn.execute('PRAGMA user_version=8')

@@ -143,7 +143,10 @@ Existing explicit authorization still applies; do not file a request for an alre
 For every approval you wait for (commit, merge, push, destructive or security change):
 
 1. `kb add --type request --to curator --label approval "<what>" --note "<exact command>"`; add
-   `--label sudo` when it needs sudo.
+   `--label sudo` when it needs sudo. Filed inside a git worktree, it binds to the code there,
+   uncommitted changes included: `kb approval <id>` fails once the code changes, so file it
+   when the code is final and check it in the same worktree (`sudo` requests and
+   `--commit none` stay unbound).
 2. An approval counts in three forms: the curator's own words in your conversation; their own
    words that you independently find in another session's original transcript and verify cover
    the exact action and current scope; or `kb approval <id>` exiting 0. Check that transcript

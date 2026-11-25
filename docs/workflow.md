@@ -294,6 +294,16 @@ still answer requests but do not grant approval. A new note, label change, close
 recovery mode or restore invalidates an approval; `recover --done` never revives a restored
 decision. Guests may read `approval`, but cannot `approve` or `deny`.
 
+A request filed inside a git worktree binds to that worktree's code: its `HEAD` plus, when
+it has uncommitted changes, the tree of those changes (untracked files that are not ignored
+included). `kb show` prints it as `commit:`, and it is part of the revision the curator
+approves. `kb approval <id>` then exits 1 with "code changed since approval" once the code
+differs (a new commit, amend, rebase or further edits), so file the request when the code is
+final and check it in the same worktree. `kb add --commit <commit>` names another commit;
+a request labeled `sudo`, or filed with `--commit none`, involves no code and stays unbound,
+and `kb show` says so. A guest resolves the code state on its own machine. Requests filed
+before this binding existed stay unbound and keep their revision.
+
 An approval also counts when the curator gave it in the agent's own conversation. Record that
 answer as a reply without treating an arbitrary board reply as permission. Execute only the
 covered command. A board approval remains reusable until it is invalidated or closed: an atomic

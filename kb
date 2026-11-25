@@ -34,7 +34,7 @@ except ImportError:
     fcntl = None
 
 VERSION = '0.4.0'  # release number (SemVer); bumped in the commit tagged vVERSION
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 DEFAULT_DB = os.path.join('~', '.local', 'share', 'agent-kanban', 'board.sqlite')
 CURATOR = 'curator'
 OPEN = ('todo', 'doing', 'blocked')
@@ -225,6 +225,10 @@ UPDATE ticket SET reopened=coalesce((SELECT max(n.id) FROM note n
     9: """
 ALTER TABLE ticket ADD COLUMN target TEXT NOT NULL DEFAULT '';
 UPDATE ticket SET target=coalesce((SELECT host FROM session WHERE token=ticket.opener), '');
+""",
+    # The commit an approval request to curator binds its approval to; empty when unbound.
+    10: """
+ALTER TABLE ticket ADD COLUMN commit_sha TEXT NOT NULL DEFAULT '';
 """,
 }
 
@@ -1185,6 +1189,9 @@ def ticket_rev(conn, ticket_id, before_note=None):
                          ' AND (? IS NULL OR id < ?) ORDER BY id',
                          (ticket_id, before_note, before_note)).fetchall()
     payload = [restore_generation(conn), list(row), [list(n) for n in notes]]
+    commit = conn.execute('SELECT commit_sha FROM ticket WHERE id=?', (ticket_id,)).fetchone()[0]
+    if commit:  # unbound requests keep the revision they had before commit binding existed
+        payload.append(commit)
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False,
                                     separators=(',', ':')).encode('utf-8')).hexdigest()[:16]
 
@@ -1230,6 +1237,87 @@ def cmd_decide(args):
     print('ticket %d: %s' % (args.id, args.command))
 
 
+# A bound code state: the HEAD commit, plus '+<tree>' when the worktree differs from it.
+STATE_RE = re.compile(r'[0-9a-f]{40}([0-9a-f]{24})?(\+[0-9a-f]{40}([0-9a-f]{24})?)?')
+
+
+def code_state(cwd=None):
+    """HEAD of the git worktree around cwd, plus the tree of its uncommitted state, or ''.
+
+    The tree covers tracked changes and untracked files that are not ignored, built in a
+    throwaway index so the real one stays untouched. When it cannot be built, the state is
+    marked unknown, which never matches: a failed check rejects instead of passing."""
+    cwd = cwd or os.getcwd()
+    head = git(cwd, 'rev-parse', '--verify', 'HEAD')
+    top = head and git(cwd, 'rev-parse', '--show-toplevel')
+    if not top:
+        return ''
+    tmp = tempfile.mkdtemp(prefix='kb-state-')
+    env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, 'index'))
+    tree = None
+    try:
+        for cmd in (['read-tree', head], ['add', '-A'], ['write-tree']):
+            r = subprocess.run(['git', '-C', top] + cmd, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, universal_newlines=True, timeout=60)
+            if r.returncode != 0:
+                break
+            tree = r.stdout.strip() if cmd[0] == 'write-tree' else None
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        tree = None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if not tree:
+        return head + '+unknown'
+    return head if tree == git(top, 'rev-parse', head + '^{tree}') else head + '+' + tree
+
+
+def is_approval_request(rtype, to, labels):
+    return rtype == 'request' and to == CURATOR and 'approval' in labels
+
+
+def default_commit(labels):
+    """What an approval request binds to without --commit: the code state here; a sudo
+    command involves no code and stays unbound."""
+    return 'none' if 'sudo' in labels else (code_state() or 'none')
+
+
+def resolve_commit(value):
+    """A --commit value as a bound state: none stays none, a commit name resolves here."""
+    value = (value or '').strip()
+    if value in ('', 'none') or STATE_RE.fullmatch(value):
+        return value or 'none'
+    return git(os.getcwd(), 'rev-parse', '--verify', value + '^{commit}') or value
+
+
+def approval_commit(args, labels):
+    """The code state an approval request to curator binds to; '' when unbound.
+
+    --commit names a commit (or none); without it the request binds to the worktree's
+    current state (default_commit). A guest resolves it itself and always sends --commit
+    (guest_main): the host cannot see the guest's worktree, so a guest request without it
+    comes from an older guest and is refused rather than filed unbound."""
+    labels = labels.split(',')
+    if not is_approval_request(args.type, args.to, labels):
+        if args.commit is not None:
+            raise UsageError('--commit is only for an approval request to curator')
+        return ''
+    if args.commit is None:
+        if GUEST:
+            raise UsageError('this guest kb is too old to bind approvals to a commit; update it')
+        value = default_commit(labels)
+    else:
+        value = args.commit.strip() if GUEST else resolve_commit(args.commit)
+    if value.endswith('+unknown'):  # also what a guest sends for its own worktree
+        raise UsageError('cannot record the uncommitted code state of this worktree (git add -A'
+                         ' failed: unreadable files, a nested repository or a timeout); fix'
+                         ' the worktree or commit, then file the request again')
+    if value == 'none':
+        return ''
+    if not STATE_RE.fullmatch(value):
+        raise UsageError('--commit needs a commit of this worktree, a full SHA, or none')
+    return value
+
+
 def cmd_approval(args):
     conn = connect()
     conn.execute('BEGIN')  # one snapshot for decision, notes, request and restore metadata
@@ -1243,6 +1331,15 @@ def cmd_approval(args):
                             (args.id,)).fetchone()[0] != row[2] \
             or ticket_rev(conn, args.id, before_note=row[2]) != row[1]:
         raise Rejected('no current approval for ticket %d' % args.id)
+    commit = conn.execute('SELECT commit_sha FROM ticket WHERE id=?', (args.id,)).fetchone()[0]
+    if commit:
+        if args.head is not None and not GUEST:
+            raise UsageError('--head is set by a guest for its own worktree only')
+        head = (code_state() if not GUEST else args.head or '').strip()
+        if head != commit:
+            raise Rejected('no current approval for ticket %d: code changed since approval;'
+                           ' run it in the worktree the request was filed from, or file a new'
+                           ' request for the current code' % args.id)
     print(row[4])
 
 
@@ -1357,6 +1454,7 @@ def cmd_add(args):
         raise UsageError('a backlog ticket is parked, not claimed')
     labels = ','.join(labels)
     text = (args.note or '').strip() or (read_text(False) if args.stdin else '')
+    commit = approval_commit(args, labels)
     conn = connect()
     me, _ = session(conn, args)
     # A harness session (or the curator) adds a task to work on it now; a token session
@@ -1385,10 +1483,10 @@ def cmd_add(args):
             host, worktree, branch = '', '', ''  # execution metadata belongs to the claimer
         cur = conn.execute(
             'INSERT INTO ticket (type, title, repo, status, addressee, assignee, opener, labels,'
-            ' created, updated, claimed_at, last_activity, host, worktree, branch, merge_target, target)'
-            ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ' created, updated, claimed_at, last_activity, host, worktree, branch, merge_target, target,'
+            ' commit_sha) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (args.type, title, repo, status, args.to, assignee, me, labels, t, t, claimed, t,
-             host, worktree, branch, args.merge_target, target))
+             host, worktree, branch, args.merge_target, target, commit))
         ticket_id = cur.lastrowid
         if args.type == 'request':
             # notify.d hooks and kb-watch react to notes; without one a request goes unnoticed
@@ -1866,16 +1964,24 @@ def cmd_label(args):
     conn = connect()
     me, _ = session(conn, args)
     with transaction(conn):
-        row = conn.execute('SELECT type, labels, status FROM ticket WHERE id=?',
-                           (args.id,)).fetchone()
+        row = conn.execute('SELECT type, labels, status, addressee, commit_sha FROM ticket'
+                           ' WHERE id=?', (args.id,)).fetchone()
         require(conn, row is not None, args.id, 'label')
         labels = {l for l in row[1].split(',') if l}
+        before = set(labels)
         labels |= {l.strip().lstrip('+') for l in args.labels if l.strip().lstrip('+')}
         labels -= {l.strip() for l in args.remove}
         if any(',' in l for l in labels):
             raise UsageError('a label contains no comma')
         if BACKLOG in labels and row[0] == 'request':
             raise Rejected('requests cannot go to the backlog; answer or withdraw them')
+        # An approval's code state is bound when it is filed; a label change must not turn an
+        # unbound request into a code approval (kb 901).
+        if not row[4] and is_approval_request(row[0], row[3], labels) and (
+                not is_approval_request(row[0], row[3], before)
+                or 'sudo' in before and 'sudo' not in labels):
+            raise Rejected('label rejected: an approval request binds its code when filed;'
+                           ' file a new request with kb add --label approval')
         new = ','.join(sorted(labels))
         if new != row[1]:
             conn.execute('UPDATE ticket SET labels=?, updated=? WHERE id=?',
@@ -2888,6 +2994,11 @@ def cmd_show(args):
                 'host', 'worktree', 'branch', 'merge_target', 'target'):
         print('%s: %s' % (key.replace('_name', ''), ticket[key] if ticket[key] is not None else ''))
     print('clients: %s' % ', '.join(ticket_clients(conn, [args.id]).get(args.id, [])))
+    if ticket['type'] == 'request' and ticket['addressee'] == CURATOR \
+            and 'approval' in ticket['labels'].split(','):
+        bound = ticket['commit_sha']
+        print('commit: %s' % (bound.replace('+', ' with uncommitted changes, tree ') if bound
+                              else 'none (approval not bound to a commit)'))
     for n in conn.execute('SELECT n.time, slabel(s.name, s.harness, s.token) AS name, n.kind,'
                           ' n.text FROM note n'
                           ' JOIN session s ON s.token=n.author WHERE n.ticket_id=? ORDER BY n.id',
@@ -3452,6 +3563,21 @@ def guest_main(argv, host):
     except UsageError as e:
         sys.stderr.write('kb: %s\n' % e)
         return EXIT_USAGE
+    # Code states are resolved here: the host cannot see the guest's worktree.
+    if args.command == 'add':
+        labels = {l.strip() for v in args.label or [] for l in v.split(',')}
+        if is_approval_request(args.type, args.to, labels):
+            value = default_commit(labels) if args.commit is None else resolve_commit(args.commit)
+            kept, skip = [], False
+            for a in argv:  # drop the caller's --commit; its resolved value follows
+                if skip or a == '--commit' or a.startswith('--commit='):
+                    skip = a == '--commit'
+                    continue
+                kept.append(a)
+            argv = kept + ['--commit', value]
+    elif args.command == 'approval':
+        value = code_state() if args.head is None else resolve_commit(args.head)
+        argv = list(argv) + ['--head', value or 'none']
     request = request_line(argv, guest_context())
     # Only commands that read note text get the guest's stdin; any other would wait for EOF.
     if (args.command in STDIN_COMMANDS or getattr(args, 'stdin', False)) \
@@ -4757,6 +4883,9 @@ def build_parser():
     claim.add_argument('--todo', action='store_true',
                        help='task: leave it todo for any session (default with --session)')
     s.add_argument('--note', help='first note text (else --stdin)')
+    s.add_argument('--commit', help='approval request to curator: the commit its approval'
+                   ' binds to (default: this worktree with its uncommitted changes; sudo or'
+                   ' none: unbound)')
 
     s = cmd('claim', cmd_claim, 'claim a todo ticket', [ident, where], ticket=True)
     s.add_argument('--take', action='store_true',
@@ -4826,8 +4955,9 @@ def build_parser():
         s.add_argument('--rev', required=True, help='revision printed by kb show')
         s.add_argument('--stdin', required=True, action='store_true',
                        help="read the curator's own words from stdin")
-    cmd('approval', cmd_approval, 'print a still-current approval (exit 1 otherwise)',
-        ticket=True)
+    s = cmd('approval', cmd_approval, 'print a still-current approval (exit 1 otherwise)',
+            ticket=True)
+    s.add_argument('--head', help=argparse.SUPPRESS)  # set by a guest for its own worktree
     s = cmd('sessions', cmd_sessions, 'session names seen in the last %d days or holding a'
             ' ticket, last seen first (read-only)' % KNOWN_DAYS, [ident])
     s.add_argument('--all', action='store_true', help='every current session name')
